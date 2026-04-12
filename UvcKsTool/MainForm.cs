@@ -21,17 +21,39 @@ internal sealed class MainForm : Form
     private readonly KsCommandSender _sender = new();
     private readonly ComboBox _deviceComboBox = new();
     private readonly Button _refreshButton = new();
-    private readonly Button _startPreviewButton = new();
-    private readonly Button _stopPreviewButton = new();
+    private readonly Button _startMeasurementButton = new();
+    private readonly Button _stopMeasurementButton = new();
     private readonly PictureBox _previewBox = new();
     private readonly TextBox _logTextBox = new();
     private readonly ComboBox _paletteComboBox = new();
     private readonly TextBox _rawCommandTextBox = new();
     private readonly Label _previewLabel = new();
+    private readonly Label _centerLabel = new();
+    private readonly Label _maxLabel = new();
+    private readonly Label _minLabel = new();
+    private readonly Label _hoverLabel = new();
+    private readonly Label _probeLabel = new();
+    private readonly Label _frameInfoLabel = new();
+    private readonly Label _versionLabel = new();
     private readonly NumericUpDown[] _pointXEditors = new NumericUpDown[3];
     private readonly NumericUpDown[] _pointYEditors = new NumericUpDown[3];
+    private readonly NumericUpDown _fixEditor = CreateDecimalEditor(-50, 50, 0.1m, 2, 0);
+    private readonly NumericUpDown _reflectedEditor = CreateDecimalEditor(-50, 500, 0.5m, 1, 20);
+    private readonly NumericUpDown _ambientEditor = CreateDecimalEditor(-50, 500, 0.5m, 1, 20);
+    private readonly NumericUpDown _humidityEditor = CreateDecimalEditor(0, 100, 0.5m, 1, 50);
+    private readonly NumericUpDown _emissivityEditor = CreateDecimalEditor(0.10m, 1.00m, 0.01m, 2, 0.95m);
+    private readonly NumericUpDown _distanceEditor = CreateDecimalEditor(0, 5000, 1m, 0, 1);
+    private readonly NumericUpDown _shutterFixEditor = CreateDecimalEditor(-50, 50, 0.1m, 2, 0);
+    private readonly ComboBox _rangeModeComboBox = new();
+    private readonly ComboBox _cameraLensComboBox = new();
 
     private CameraPreviewController? _previewController;
+    private RadiometricFrame? _latestFrame;
+    private Point? _hoverPoint;
+    private Point? _lockedProbePoint;
+    private bool _measurementEditorsInitializedFromFrame;
+    private bool _measurementSettingsTouched;
+    private bool _suppressMeasurementSettingEvents;
 
     public MainForm()
     {
@@ -39,8 +61,8 @@ internal sealed class MainForm : Form
         Font = new Font("Segoe UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
         Text = "UVC KS Tool";
         StartPosition = FormStartPosition.CenterScreen;
-        MinimumSize = new Size(1260, 760);
-        Size = new Size(1440, 900);
+        MinimumSize = new Size(1320, 820);
+        Size = new Size(1520, 980);
 
         InitializeLayout();
 
@@ -58,15 +80,15 @@ internal sealed class MainForm : Form
         _refreshButton.AutoSize = true;
         _refreshButton.Click += (_, _) => RefreshDevices();
 
-        _startPreviewButton.Text = "Start Preview";
-        _startPreviewButton.AutoSize = true;
-        _startPreviewButton.Click += (_, _) => StartPreview();
+        _startMeasurementButton.Text = "Start Measurement";
+        _startMeasurementButton.AutoSize = true;
+        _startMeasurementButton.Click += (_, _) => StartMeasurement();
 
-        _stopPreviewButton.Text = "Stop Preview";
-        _stopPreviewButton.AutoSize = true;
-        _stopPreviewButton.Click += (_, _) => StopPreview();
+        _stopMeasurementButton.Text = "Stop Measurement";
+        _stopMeasurementButton.AutoSize = true;
+        _stopMeasurementButton.Click += (_, _) => StopMeasurement();
 
-        _previewLabel.Text = "Preview stopped.";
+        _previewLabel.Text = "Measurement stopped.";
         _previewLabel.AutoSize = true;
         _previewLabel.Margin = new Padding(8, 8, 3, 0);
 
@@ -82,22 +104,49 @@ internal sealed class MainForm : Form
         topBar.Controls.Add(new Label { Text = "Device", AutoSize = true, Margin = new Padding(0, 8, 8, 0) });
         topBar.Controls.Add(_deviceComboBox);
         topBar.Controls.Add(_refreshButton);
-        topBar.Controls.Add(_startPreviewButton);
-        topBar.Controls.Add(_stopPreviewButton);
+        topBar.Controls.Add(_startMeasurementButton);
+        topBar.Controls.Add(_stopMeasurementButton);
         topBar.Controls.Add(_previewLabel);
 
         _previewBox.Dock = DockStyle.Fill;
         _previewBox.BackColor = Color.FromArgb(20, 20, 20);
         _previewBox.BorderStyle = BorderStyle.FixedSingle;
         _previewBox.SizeMode = PictureBoxSizeMode.Zoom;
+        _previewBox.MouseMove += PreviewBoxOnMouseMove;
+        _previewBox.MouseLeave += (_, _) =>
+        {
+            _hoverPoint = null;
+            UpdateReadouts();
+        };
+        _previewBox.MouseClick += PreviewBoxOnMouseClick;
 
         var previewGroup = new GroupBox
         {
-            Text = "Preview",
+            Text = "Measurement Preview",
             Dock = DockStyle.Fill,
             Padding = new Padding(12)
         };
         previewGroup.Controls.Add(_previewBox);
+
+        var measurementSummaryGroup = new GroupBox
+        {
+            Text = "Live Measurements",
+            Dock = DockStyle.Fill,
+            Padding = new Padding(10),
+            Height = 180
+        };
+        measurementSummaryGroup.Controls.Add(BuildMeasurementSummaryContent());
+
+        var leftPane = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2
+        };
+        leftPane.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+        leftPane.RowStyles.Add(new RowStyle(SizeType.Absolute, 180F));
+        leftPane.Controls.Add(previewGroup, 0, 0);
+        leftPane.Controls.Add(measurementSummaryGroup, 0, 1);
 
         var commandScrollPanel = new Panel
         {
@@ -110,7 +159,7 @@ internal sealed class MainForm : Form
         commandScrollPanel.Controls.Add(commandStack);
         commandScrollPanel.Resize += (_, _) =>
         {
-            commandStack.Width = Math.Max(380, commandScrollPanel.ClientSize.Width - 20);
+            commandStack.Width = Math.Max(420, commandScrollPanel.ClientSize.Width - 20);
         };
 
         var content = new TableLayoutPanel
@@ -120,8 +169,8 @@ internal sealed class MainForm : Form
             Padding = new Padding(12, 0, 12, 8)
         };
         content.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-        content.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 430F));
-        content.Controls.Add(previewGroup, 0, 0);
+        content.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 460F));
+        content.Controls.Add(leftPane, 0, 0);
         content.Controls.Add(commandScrollPanel, 1, 0);
 
         _logTextBox.Dock = DockStyle.Fill;
@@ -147,12 +196,43 @@ internal sealed class MainForm : Form
         };
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 190F));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 210F));
         root.Controls.Add(topBar, 0, 0);
         root.Controls.Add(content, 0, 1);
         root.Controls.Add(logGroup, 0, 2);
 
         Controls.Add(root);
+        UpdateReadouts();
+        UpdateMeasurementButtons();
+    }
+
+    private Control BuildMeasurementSummaryContent()
+    {
+        var table = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 7
+        };
+        table.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90F));
+        table.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+
+        AddSummaryRow(table, 0, "Center", _centerLabel);
+        AddSummaryRow(table, 1, "Max", _maxLabel);
+        AddSummaryRow(table, 2, "Min", _minLabel);
+        AddSummaryRow(table, 3, "Hover", _hoverLabel);
+        AddSummaryRow(table, 4, "Probe", _probeLabel);
+        AddSummaryRow(table, 5, "Frame", _frameInfoLabel);
+        AddSummaryRow(table, 6, "Version", _versionLabel);
+        return table;
+    }
+
+    private static void AddSummaryRow(TableLayoutPanel table, int rowIndex, string label, Label valueLabel)
+    {
+        valueLabel.AutoSize = true;
+        valueLabel.Margin = new Padding(0, 6, 0, 0);
+        table.Controls.Add(new Label { Text = label, AutoSize = true, Margin = new Padding(0, 6, 10, 0) }, 0, rowIndex);
+        table.Controls.Add(valueLabel, 1, rowIndex);
     }
 
     private TableLayoutPanel BuildCommandStack()
@@ -167,14 +247,13 @@ internal sealed class MainForm : Form
             Margin = new Padding(0)
         };
         stack.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-
+        stack.Controls.Add(CreateSectionGroup("Measurement", BuildMeasurementControlsContent()));
         stack.Controls.Add(CreateSectionGroup("Common Commands", BuildCommonCommandsContent()));
         stack.Controls.Add(CreateSectionGroup("Legacy Follow-up", BuildLegacyFollowUpContent()));
         stack.Controls.Add(CreateSectionGroup("Palette", BuildPaletteContent()));
         stack.Controls.Add(CreateSectionGroup("Temperature Points", BuildTemperaturePointsContent()));
         stack.Controls.Add(CreateSectionGroup("Raw Command", BuildRawCommandContent()));
         stack.Controls.Add(CreateSectionGroup("Notes", BuildNotesContent()));
-
         return stack;
     }
 
@@ -194,9 +273,80 @@ internal sealed class MainForm : Form
         return group;
     }
 
-    private Control BuildCommonCommandsContent()
+    private Control BuildMeasurementControlsContent()
     {
-        return BuildButtonGrid(
+        InitializeMeasurementSelectors();
+        WireMeasurementSettingEvents();
+
+        var grid = new TableLayoutPanel
+        {
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            ColumnCount = 2
+        };
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 130F));
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+
+        AddMeasurementEditor(grid, 0, "Fix", _fixEditor);
+        AddMeasurementEditor(grid, 1, "Reflected", _reflectedEditor);
+        AddMeasurementEditor(grid, 2, "Ambient", _ambientEditor);
+        AddMeasurementEditor(grid, 3, "Humidity", _humidityEditor);
+        AddMeasurementEditor(grid, 4, "Emissivity", _emissivityEditor);
+        AddMeasurementEditor(grid, 5, "Distance", _distanceEditor);
+        AddMeasurementEditor(grid, 6, "Shutter Fix", _shutterFixEditor);
+        AddMeasurementEditor(grid, 7, "Range Mode", _rangeModeComboBox);
+        AddMeasurementEditor(grid, 8, "Camera Lens", _cameraLensComboBox);
+
+        var applyButton = new Button { Text = "Apply Settings", AutoSize = true };
+        applyButton.Click += (_, _) => ApplyMeasurementSettings(forceLog: true);
+
+        var refreshButton = new Button { Text = "Shutter / NUC Refresh", AutoSize = true };
+        refreshButton.Click += (_, _) => RequestMeasurementRefresh();
+
+        var exportButton = new Button { Text = "Export Debug", AutoSize = true };
+        exportButton.Click += (_, _) => ExportDebugCapture();
+
+        var actions = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            WrapContents = true,
+            Margin = new Padding(0, 10, 0, 0)
+        };
+        actions.Controls.Add(applyButton);
+        actions.Controls.Add(refreshButton);
+        actions.Controls.Add(exportButton);
+
+        var note = new Label
+        {
+            AutoSize = true,
+            ForeColor = Color.DimGray,
+            Margin = new Padding(0, 8, 0, 0),
+            Text = "This mode consumes raw 256x196 transport frames, parses the 128-byte tail block, computes a managed temperature field, and renders preview from the decoded temperatures."
+        };
+
+        var outer = new TableLayoutPanel
+        {
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            ColumnCount = 1
+        };
+        outer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        outer.Controls.Add(grid, 0, 0);
+        outer.Controls.Add(actions, 0, 1);
+        outer.Controls.Add(note, 0, 2);
+        return outer;
+    }
+
+    private static void AddMeasurementEditor(TableLayoutPanel layout, int rowIndex, string label, Control editor)
+    {
+        layout.Controls.Add(new Label { Text = label, AutoSize = true, Margin = new Padding(0, 8, 10, 0) }, 0, rowIndex);
+        editor.Margin = new Padding(0, 4, 0, 0);
+        layout.Controls.Add(editor, 1, rowIndex);
+    }
+
+    private Control BuildCommonCommandsContent() =>
+        BuildButtonGrid(
             ("Startup (0xA120)", "startup-newdemo"),
             ("NUC / Shutter", "nuc"),
             ("Source Raw", "source-raw"),
@@ -204,7 +354,6 @@ internal sealed class MainForm : Form
             ("K-Table", "k-table"),
             ("Wide Dyn On", "wide-dynamic-on"),
             ("Wide Dyn Off", "wide-dynamic-off"));
-    }
 
     private Control BuildLegacyFollowUpContent()
     {
@@ -216,14 +365,9 @@ internal sealed class MainForm : Form
         };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
 
-        var commitButton = new Button
-        {
-            Text = "Commit Temp Points",
-            AutoSize = true
-        };
+        var commitButton = new Button { Text = "Commit Temp Points", AutoSize = true };
         commitButton.Click += (_, _) => CommitTemperaturePoints();
         layout.Controls.Add(commitButton, 0, 0);
-
         layout.Controls.Add(new Label
         {
             AutoSize = true,
@@ -231,7 +375,6 @@ internal sealed class MainForm : Form
             Margin = new Padding(3, 8, 3, 0),
             Text = "Runs the observed legacy follow-up sequence 0x8027 -> 0x80FE. Standalone 0x8027 is hidden because some devices reject it as an incomplete request."
         }, 0, 1);
-
         return layout;
     }
 
@@ -250,11 +393,7 @@ internal sealed class MainForm : Form
         _paletteComboBox.DropDownStyle = ComboBoxStyle.DropDownList;
         _paletteComboBox.Width = 220;
 
-        var applyButton = new Button
-        {
-            Text = "Apply Palette",
-            AutoSize = true
-        };
+        var applyButton = new Button { Text = "Apply Palette", AutoSize = true };
         applyButton.Click += (_, _) =>
         {
             if (_paletteComboBox.SelectedItem is PaletteOption option)
@@ -298,11 +437,7 @@ internal sealed class MainForm : Form
             _pointYEditors[i] = CreateCoordinateEditor();
 
             var pointIndex = i;
-            var sendPointButton = new Button
-            {
-                Text = $"Send P{i + 1}",
-                AutoSize = true
-            };
+            var sendPointButton = new Button { Text = $"Send P{i + 1}", AutoSize = true };
             sendPointButton.Click += (_, _) => SendTemperaturePoint(pointIndex);
 
             layout.Controls.Add(new Label { Text = $"P{i + 1}", AutoSize = true, Margin = new Padding(3, 8, 10, 0) }, 0, i + 1);
@@ -311,12 +446,7 @@ internal sealed class MainForm : Form
             layout.Controls.Add(sendPointButton, 3, i + 1);
         }
 
-        var sendAllButton = new Button
-        {
-            Text = "Send All Points",
-            AutoSize = true,
-            Margin = new Padding(0, 10, 0, 0)
-        };
+        var sendAllButton = new Button { Text = "Send All Points", AutoSize = true, Margin = new Padding(0, 10, 0, 0) };
         sendAllButton.Click += (_, _) => SendAllTemperaturePoints();
 
         var outer = new TableLayoutPanel
@@ -328,7 +458,6 @@ internal sealed class MainForm : Form
         outer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
         outer.Controls.Add(layout, 0, 0);
         outer.Controls.Add(sendAllButton, 0, 1);
-
         return outer;
     }
 
@@ -337,11 +466,7 @@ internal sealed class MainForm : Form
         _rawCommandTextBox.Width = 180;
         _rawCommandTextBox.Text = "0x8000";
 
-        var sendButton = new Button
-        {
-            Text = "Send Raw",
-            AutoSize = true
-        };
+        var sendButton = new Button { Text = "Send Raw", AutoSize = true };
         sendButton.Click += (_, _) => SendRawCommand();
 
         var hintLabel = new Label
@@ -374,15 +499,13 @@ internal sealed class MainForm : Form
         return layout;
     }
 
-    private static Control BuildNotesContent()
-    {
-        return new Label
+    private static Control BuildNotesContent() =>
+        new Label
         {
             AutoSize = true,
             ForeColor = Color.DimGray,
-            Text = "Preview uses OpenCV via DirectShow. All command buttons send IKsControl requests through PROPSETID_VIDCAP_CAMERACONTROL / ZOOM / SET."
+            Text = "Measurement preview now uses raw 16-bit transport frames and a managed thermometry/search pipeline. KS buttons still send IKsControl requests through PROPSETID_VIDCAP_CAMERACONTROL / ZOOM / SET."
         };
-    }
 
     private Control BuildButtonGrid(params (string Text, string CommandName)[] buttons)
     {
@@ -407,21 +530,73 @@ internal sealed class MainForm : Form
 
             var commandName = buttons[i].CommandName;
             button.Click += (_, _) => SendNamedCommand(commandName);
-
             layout.Controls.Add(button, i % 2, i / 2);
         }
 
         return layout;
     }
 
-    private static NumericUpDown CreateCoordinateEditor()
-    {
-        return new NumericUpDown
+    private static NumericUpDown CreateCoordinateEditor() =>
+        new()
         {
             Minimum = 0,
             Maximum = 255,
             Width = 70
         };
+
+    private static NumericUpDown CreateDecimalEditor(decimal minimum, decimal maximum, decimal increment, int decimalPlaces, decimal value) =>
+        new()
+        {
+            Minimum = minimum,
+            Maximum = maximum,
+            Increment = increment,
+            DecimalPlaces = decimalPlaces,
+            Value = value,
+            Width = 120
+        };
+
+    private void InitializeMeasurementSelectors()
+    {
+        if (_rangeModeComboBox.Items.Count == 0)
+        {
+            _rangeModeComboBox.DropDownStyle = ComboBoxStyle.DropDownList;
+            _rangeModeComboBox.Width = 220;
+            _rangeModeComboBox.Items.Add(new RangeModeOption(CameraThermometryState.NormalRangeMode, "0x78 Normal (-20°C to 120°C)"));
+            _rangeModeComboBox.Items.Add(new RangeModeOption(CameraThermometryState.WideRangeMode, "0x190 Wide (120°C to 450°C)"));
+            _rangeModeComboBox.SelectedIndex = 0;
+        }
+
+        if (_cameraLensComboBox.Items.Count == 0)
+        {
+            _cameraLensComboBox.DropDownStyle = ComboBoxStyle.DropDownList;
+            _cameraLensComboBox.Width = 220;
+            _cameraLensComboBox.Items.Add(new CameraLensOption(CameraThermometryState.DefaultCameraLens, "0x44 Default lens path"));
+            _cameraLensComboBox.Items.Add(new CameraLensOption(CameraThermometryState.AlternateCameraLens, "0x82 Alternate lens path"));
+            _cameraLensComboBox.SelectedIndex = 0;
+        }
+    }
+
+    private void WireMeasurementSettingEvents()
+    {
+        _fixEditor.ValueChanged += (_, _) => OnMeasurementSettingEdited();
+        _reflectedEditor.ValueChanged += (_, _) => OnMeasurementSettingEdited();
+        _ambientEditor.ValueChanged += (_, _) => OnMeasurementSettingEdited();
+        _humidityEditor.ValueChanged += (_, _) => OnMeasurementSettingEdited();
+        _emissivityEditor.ValueChanged += (_, _) => OnMeasurementSettingEdited();
+        _distanceEditor.ValueChanged += (_, _) => OnMeasurementSettingEdited();
+        _shutterFixEditor.ValueChanged += (_, _) => OnMeasurementSettingEdited();
+        _rangeModeComboBox.SelectedIndexChanged += (_, _) => OnMeasurementSettingEdited();
+        _cameraLensComboBox.SelectedIndexChanged += (_, _) => OnMeasurementSettingEdited();
+    }
+
+    private void OnMeasurementSettingEdited()
+    {
+        if (_suppressMeasurementSettingEvents)
+        {
+            return;
+        }
+
+        _measurementSettingsTouched = true;
     }
 
     private void RefreshDevices()
@@ -450,7 +625,7 @@ internal sealed class MainForm : Form
                 Log("No DirectShow video input devices found.");
             }
 
-            UpdatePreviewButtons();
+            UpdateMeasurementButtons();
         }
         catch (Exception ex)
         {
@@ -459,7 +634,7 @@ internal sealed class MainForm : Form
         }
     }
 
-    private void StartPreview()
+    private void StartMeasurement()
     {
         var device = GetSelectedDevice();
         if (device is null)
@@ -471,47 +646,312 @@ internal sealed class MainForm : Form
         {
             _previewController ??= new CameraPreviewController(_previewBox);
             _previewController.StatusChanged -= OnPreviewStatusChanged;
+            _previewController.FrameDecoded -= OnMeasurementFrameDecoded;
             _previewController.StatusChanged += OnPreviewStatusChanged;
+            _previewController.FrameDecoded += OnMeasurementFrameDecoded;
+
+            ApplyMeasurementSettings(forceLog: false);
+            SendNamedCommand(device, "source-raw", null);
+
             _previewController.Start(device.Index);
-            _previewLabel.Text = $"Preview running: {device.DisplayText}";
-            UpdatePreviewButtons();
+            _previewLabel.Text = $"Measurement running: {device.DisplayText}";
+            UpdateMeasurementButtons();
         }
         catch (Exception ex)
         {
-            Log($"Preview start failed: {ex.Message}");
-            MessageBox.Show(this, ex.Message, "Preview failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            Log($"Measurement start failed: {ex.Message}");
+            MessageBox.Show(this, ex.Message, "Measurement failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
-    private void StopPreview()
+    private void StopMeasurement()
     {
         _previewController?.Stop();
-        _previewLabel.Text = "Preview stopped.";
-        UpdatePreviewButtons();
+        _previewLabel.Text = "Measurement stopped.";
+        UpdateMeasurementButtons();
+    }
+
+    private void ApplyMeasurementSettings(bool forceLog)
+    {
+        if (_previewController is not null)
+        {
+            if (_measurementSettingsTouched || _measurementEditorsInitializedFromFrame)
+            {
+                _previewController.UpdateThermometryParams(ReadMeasurementParams());
+            }
+
+            if (_rangeModeComboBox.SelectedItem is RangeModeOption rangeMode)
+            {
+                _previewController.UpdateRangeMode(rangeMode.Value);
+            }
+
+            if (_cameraLensComboBox.SelectedItem is CameraLensOption lensOption)
+            {
+                _previewController.UpdateCameraLens(lensOption.Value);
+            }
+
+            _previewController.UpdateShutterFix((float)_shutterFixEditor.Value);
+        }
+
+        if (forceLog)
+        {
+            var parameters = ReadMeasurementParams();
+            var rangeValue = (_rangeModeComboBox.SelectedItem as RangeModeOption)?.Value ?? CameraThermometryState.NormalRangeMode;
+            var lensValue = (_cameraLensComboBox.SelectedItem as CameraLensOption)?.Value ?? CameraThermometryState.DefaultCameraLens;
+            Log(
+                $"Measurement settings staged: fix={parameters.Fix:F2}, refl={parameters.ReflectedTemp:F1}, air={parameters.AmbientTemp:F1}, humi={parameters.Humidity:F1}, emiss={parameters.Emissivity:F2}, dist={parameters.Distance}, shutterFix={(float)_shutterFixEditor.Value:F2}, range=0x{rangeValue:X}, lens=0x{lensValue:X}");
+        }
+    }
+
+    private void RequestMeasurementRefresh()
+    {
+        var device = GetSelectedDevice();
+        if (device is null)
+        {
+            return;
+        }
+
+        SendNamedCommand(device, "nuc", null);
+        _previewController?.RequestShutterRefresh();
+        Log("Measurement refresh requested.");
+    }
+
+    private void ExportDebugCapture()
+    {
+        try
+        {
+            if (_previewController is null)
+            {
+                throw new InvalidOperationException("Start measurement first so there is a decoded frame to export.");
+            }
+
+            var exportRoot = Path.Combine(AppContext.BaseDirectory, "exports");
+            var outputDirectory = _previewController.ExportLatestCapture(exportRoot);
+            Log($"Exported debug capture to {outputDirectory}");
+        }
+        catch (Exception ex)
+        {
+            Log($"Export failed: {ex.Message}");
+            MessageBox.Show(this, ex.Message, "Export failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     private void OnPreviewStatusChanged(string message)
     {
         if (InvokeRequired)
         {
-            BeginInvoke(() => OnPreviewStatusChanged(message));
+            BeginInvoke((MethodInvoker)(() => OnPreviewStatusChanged(message)));
             return;
         }
 
         Log(message);
-
         if (!(_previewController?.IsRunning ?? false))
         {
-            _previewLabel.Text = "Preview stopped.";
+            _previewLabel.Text = "Measurement stopped.";
+        }
+
+        UpdateMeasurementButtons();
+    }
+
+    private void OnMeasurementFrameDecoded(RadiometricFrame frame)
+    {
+        if (InvokeRequired)
+        {
+            BeginInvoke((MethodInvoker)(() => OnMeasurementFrameDecoded(frame)));
+            return;
+        }
+
+        _latestFrame = frame;
+        if (!_measurementEditorsInitializedFromFrame)
+        {
+            SynchronizeMeasurementEditors(frame);
+        }
+
+        UpdateReadouts();
+    }
+
+    private void SynchronizeMeasurementEditors(RadiometricFrame frame)
+    {
+        _suppressMeasurementSettingEvents = true;
+        try
+        {
+            _fixEditor.Value = ClampEditorValue(_fixEditor, (decimal)frame.ActiveParameters.Fix);
+            _reflectedEditor.Value = ClampEditorValue(_reflectedEditor, (decimal)frame.ActiveParameters.ReflectedTemp);
+            _ambientEditor.Value = ClampEditorValue(_ambientEditor, (decimal)frame.ActiveParameters.AmbientTemp);
+            _humidityEditor.Value = ClampEditorValue(_humidityEditor, (decimal)frame.ActiveParameters.Humidity);
+            _emissivityEditor.Value = ClampEditorValue(_emissivityEditor, (decimal)frame.ActiveParameters.Emissivity);
+            _distanceEditor.Value = ClampEditorValue(_distanceEditor, frame.ActiveParameters.Distance);
+            _shutterFixEditor.Value = ClampEditorValue(_shutterFixEditor, (decimal)frame.State.ShutterFix);
+            SelectRangeMode(frame.State.RangeMode);
+            SelectCameraLens(frame.State.CameraLens);
+        }
+        finally
+        {
+            _suppressMeasurementSettingEvents = false;
+        }
+
+        _measurementEditorsInitializedFromFrame = true;
+        _measurementSettingsTouched = false;
+        Log("Measurement editors initialized from embedded frame parameters.");
+    }
+
+    private void SelectRangeMode(int value)
+    {
+        for (var i = 0; i < _rangeModeComboBox.Items.Count; i++)
+        {
+            if (_rangeModeComboBox.Items[i] is RangeModeOption option && option.Value == value)
+            {
+                _rangeModeComboBox.SelectedIndex = i;
+                return;
+            }
         }
     }
 
-    private void UpdatePreviewButtons()
+    private void SelectCameraLens(int value)
+    {
+        for (var i = 0; i < _cameraLensComboBox.Items.Count; i++)
+        {
+            if (_cameraLensComboBox.Items[i] is CameraLensOption option && option.Value == value)
+            {
+                _cameraLensComboBox.SelectedIndex = i;
+                return;
+            }
+        }
+    }
+
+    private static decimal ClampEditorValue(NumericUpDown editor, decimal value) =>
+        Math.Min(editor.Maximum, Math.Max(editor.Minimum, value));
+
+    private void UpdateMeasurementButtons()
     {
         var running = _previewController?.IsRunning ?? false;
-        _startPreviewButton.Enabled = !running && _deviceComboBox.Items.Count > 0;
-        _stopPreviewButton.Enabled = running;
+        _startMeasurementButton.Enabled = !running && _deviceComboBox.Items.Count > 0;
+        _stopMeasurementButton.Enabled = running;
     }
+
+    private void UpdateReadouts()
+    {
+        if (_latestFrame is null)
+        {
+            _centerLabel.Text = "—";
+            _maxLabel.Text = "—";
+            _minLabel.Text = "—";
+            _hoverLabel.Text = "—";
+            _probeLabel.Text = "—";
+            _frameInfoLabel.Text = "Waiting for a raw frame.";
+            _versionLabel.Text = "—";
+            return;
+        }
+
+        _centerLabel.Text = $"{_latestFrame.CenterTemp:F1} °C";
+        _maxLabel.Text = $"{_latestFrame.MaxTemp:F1} °C @ ({_latestFrame.MaxPoint.X}, {_latestFrame.MaxPoint.Y})";
+        _minLabel.Text = $"{_latestFrame.MinTemp:F1} °C @ ({_latestFrame.MinPoint.X}, {_latestFrame.MinPoint.Y})";
+        _hoverLabel.Text = FormatPointTemperature(_hoverPoint, "Move over the image");
+        _probeLabel.Text = FormatPointTemperature(_lockedProbePoint, "Click the image to lock a probe");
+        _frameInfoLabel.Text =
+            $"{_latestFrame.ThermalWidth}x{_latestFrame.ThermalHeight}, header[7/8]={_latestFrame.Header[7]:F0}/{_latestFrame.Header[8]:F0}, range=0x{_latestFrame.State.RangeMode:X}, lens=0x{_latestFrame.State.CameraLens:X}, dirty={_latestFrame.State.Dirty}";
+        _versionLabel.Text = string.IsNullOrWhiteSpace(_latestFrame.TailMetadata.ProductVersion)
+            ? "<unavailable>"
+            : _latestFrame.TailMetadata.ProductVersion;
+    }
+
+    private string FormatPointTemperature(Point? point, string fallback)
+    {
+        if (_latestFrame is null || point is null)
+        {
+            return fallback;
+        }
+
+        if (!TryGetTemperature(point.Value, out var temperature))
+        {
+            return fallback;
+        }
+
+        return $"{temperature:F1} °C @ ({point.Value.X}, {point.Value.Y})";
+    }
+
+    private bool TryGetTemperature(Point point, out float temperature)
+    {
+        temperature = 0f;
+        if (_latestFrame is null)
+        {
+            return false;
+        }
+
+        if (point.X < 0 || point.X >= _latestFrame.ThermalWidth || point.Y < 0 || point.Y >= _latestFrame.ThermalHeight)
+        {
+            return false;
+        }
+
+        var index = (point.Y * _latestFrame.ThermalWidth) + point.X;
+        temperature = _latestFrame.Temperatures[index];
+        return true;
+    }
+
+    private void PreviewBoxOnMouseMove(object? sender, MouseEventArgs e)
+    {
+        _hoverPoint = TryMapPreviewPoint(e.Location);
+        UpdateReadouts();
+    }
+
+    private void PreviewBoxOnMouseClick(object? sender, MouseEventArgs e)
+    {
+        var mappedPoint = TryMapPreviewPoint(e.Location);
+        if (mappedPoint is null)
+        {
+            return;
+        }
+
+        _lockedProbePoint = mappedPoint;
+        UpdateReadouts();
+    }
+
+    private Point? TryMapPreviewPoint(Point clientPoint)
+    {
+        if (_latestFrame is null || _previewBox.Image is null)
+        {
+            return null;
+        }
+
+        var imageRect = GetImageDisplayRectangle(_previewBox);
+        if (imageRect.Width <= 0 || imageRect.Height <= 0 || !imageRect.Contains(clientPoint))
+        {
+            return null;
+        }
+
+        var normalizedX = (clientPoint.X - imageRect.X) / (float)imageRect.Width;
+        var normalizedY = (clientPoint.Y - imageRect.Y) / (float)imageRect.Height;
+        var x = Math.Clamp((int)(normalizedX * _latestFrame.ThermalWidth), 0, _latestFrame.ThermalWidth - 1);
+        var y = Math.Clamp((int)(normalizedY * _latestFrame.ThermalHeight), 0, _latestFrame.ThermalHeight - 1);
+        return new Point(x, y);
+    }
+
+    private static Rectangle GetImageDisplayRectangle(PictureBox pictureBox)
+    {
+        if (pictureBox.Image is null || pictureBox.ClientSize.Width <= 0 || pictureBox.ClientSize.Height <= 0)
+        {
+            return Rectangle.Empty;
+        }
+
+        var image = pictureBox.Image;
+        var scale = Math.Min(
+            pictureBox.ClientSize.Width / (float)image.Width,
+            pictureBox.ClientSize.Height / (float)image.Height);
+        var drawWidth = (int)Math.Round(image.Width * scale);
+        var drawHeight = (int)Math.Round(image.Height * scale);
+        var x = (pictureBox.ClientSize.Width - drawWidth) / 2;
+        var y = (pictureBox.ClientSize.Height - drawHeight) / 2;
+        return new Rectangle(x, y, drawWidth, drawHeight);
+    }
+
+    private ThermometryParams ReadMeasurementParams() =>
+        new(
+            (float)_fixEditor.Value,
+            (float)_reflectedEditor.Value,
+            (float)_ambientEditor.Value,
+            (float)_humidityEditor.Value,
+            (float)_emissivityEditor.Value,
+            (int)_distanceEditor.Value);
 
     private void SendTemperaturePoint(int pointIndex)
     {
@@ -528,7 +968,6 @@ internal sealed class MainForm : Form
 
         var x = (int)_pointXEditors[pointIndex].Value;
         var y = (int)_pointYEditors[pointIndex].Value;
-
         SendTemperaturePoint(device, pointIndex, x, y, includeLegacyCommit: true);
     }
 
@@ -589,12 +1028,7 @@ internal sealed class MainForm : Form
     private bool SendNamedCommand(string commandName, int? value = null)
     {
         var device = GetSelectedDevice();
-        if (device is null)
-        {
-            return false;
-        }
-
-        return SendNamedCommand(device, commandName, value);
+        return device is not null && SendNamedCommand(device, commandName, value);
     }
 
     private bool SendNamedCommand(VideoDevice device, string commandName, int? value)
@@ -646,8 +1080,7 @@ internal sealed class MainForm : Form
             var result = _sender.SendAbsoluteZoomCommand(device.FriendlyName, value);
             var hr = result.HResult;
             var bytesSuffix = result.BytesReturned > 0 ? $", bytes={result.BytesReturned}" : string.Empty;
-            Log(
-                $"[{device.DisplayText}] {label} -> 0x{value:X4} ({pattern}) => 0x{unchecked((uint)hr):X8} {HResultFormatter.Format(hr)}{bytesSuffix}");
+            Log($"[{device.DisplayText}] {label} -> 0x{value:X4} ({pattern}) => 0x{unchecked((uint)hr):X8} {HResultFormatter.Format(hr)}{bytesSuffix}");
             return hr == 0;
         }
         catch (Exception ex)
@@ -694,7 +1127,7 @@ internal sealed class MainForm : Form
 
         if (_logTextBox.InvokeRequired)
         {
-            _logTextBox.BeginInvoke(() => Log(message));
+            _logTextBox.BeginInvoke((MethodInvoker)(() => Log(message)));
             return;
         }
 
@@ -720,5 +1153,15 @@ internal sealed class MainForm : Form
         ];
 
         public override string ToString() => Name;
+    }
+
+    private sealed record RangeModeOption(int Value, string Label)
+    {
+        public override string ToString() => Label;
+    }
+
+    private sealed record CameraLensOption(int Value, string Label)
+    {
+        public override string ToString() => Label;
     }
 }

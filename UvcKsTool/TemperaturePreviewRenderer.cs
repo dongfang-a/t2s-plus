@@ -5,7 +5,7 @@ namespace UvcKsTool;
 
 internal static class TemperaturePreviewRenderer
 {
-    public static Bitmap Render(RadiometricFrame frame)
+    public static Bitmap Render(RadiometricFrame frame, int paletteIndex)
     {
         var bitmap = new Bitmap(frame.ThermalWidth, frame.ThermalHeight, PixelFormat.Format24bppRgb);
         var data = bitmap.LockBits(
@@ -27,7 +27,7 @@ internal static class TemperaturePreviewRenderer
                 {
                     var index = (y * bitmap.Width) + x;
                     var normalized = Math.Clamp((frame.Temperatures[index] - min) / span, 0f, 1f);
-                    var color = MapColor(normalized);
+                    var color = MapColor(normalized, paletteIndex);
                     var pixelOffset = rowOffset + (x * 3);
                     buffer[pixelOffset] = color.B;
                     buffer[pixelOffset + 1] = color.G;
@@ -48,24 +48,26 @@ internal static class TemperaturePreviewRenderer
         return bitmap;
     }
 
-    private static Color MapColor(float normalized)
+    private static Color MapColor(float normalized, int paletteIndex)
     {
-        if (normalized < 0.25f)
+        Color[] stops = paletteIndex switch
         {
-            return Blend(Color.FromArgb(15, 15, 30), Color.DarkBlue, normalized / 0.25f);
-        }
+            0 => [Color.Black, Color.DimGray, Color.Gainsboro, Color.White],
+            1 => [Color.White, Color.Gainsboro, Color.DimGray, Color.Black],
+            2 => [Color.FromArgb(12, 24, 88), Color.RoyalBlue, Color.OrangeRed, Color.Yellow],
+            3 => [Color.FromArgb(56, 18, 84), Color.MediumPurple, Color.OrangeRed, Color.Yellow],
+            4 => [Color.Navy, Color.SeaGreen, Color.Orange, Color.Red],
+            5 => [Color.DarkBlue, Color.Cyan, Color.LimeGreen, Color.Yellow, Color.Red],
+            6 => [Color.Purple, Color.DeepSkyBlue, Color.Lime, Color.Yellow, Color.OrangeRed],
+            7 => [Color.Black, Color.Maroon, Color.Red, Color.Orange],
+            8 => [Color.DarkOliveGreen, Color.DarkGreen, Color.OrangeRed, Color.Red],
+            9 => [Color.Navy, Color.Teal, Color.OrangeRed, Color.HotPink],
+            10 => [Color.Black, Color.DarkBlue, Color.Cyan, Color.Yellow, Color.Red, Color.White],
+            11 => [Color.Black, Color.Firebrick, Color.Red, Color.Orange, Color.Yellow],
+            _ => [Color.DarkBlue, Color.Cyan, Color.Yellow, Color.Red]
+        };
 
-        if (normalized < 0.5f)
-        {
-            return Blend(Color.DarkBlue, Color.Cyan, (normalized - 0.25f) / 0.25f);
-        }
-
-        if (normalized < 0.75f)
-        {
-            return Blend(Color.Cyan, Color.Yellow, (normalized - 0.5f) / 0.25f);
-        }
-
-        return Blend(Color.Yellow, Color.Red, (normalized - 0.75f) / 0.25f);
+        return InterpolateStops(stops, normalized);
     }
 
     private static Color Blend(Color start, Color end, float t)
@@ -75,6 +77,26 @@ internal static class TemperaturePreviewRenderer
         var g = start.G + ((end.G - start.G) * clamped);
         var b = start.B + ((end.B - start.B) * clamped);
         return Color.FromArgb((int)r, (int)g, (int)b);
+    }
+
+    private static Color InterpolateStops(IReadOnlyList<Color> stops, float normalized)
+    {
+        if (stops.Count == 0)
+        {
+            return Color.Black;
+        }
+
+        if (stops.Count == 1)
+        {
+            return stops[0];
+        }
+
+        var clamped = Math.Clamp(normalized, 0f, 1f);
+        var scaled = clamped * (stops.Count - 1);
+        var lowerIndex = Math.Min((int)Math.Floor(scaled), stops.Count - 2);
+        var upperIndex = lowerIndex + 1;
+        var localT = scaled - lowerIndex;
+        return Blend(stops[lowerIndex], stops[upperIndex], localT);
     }
 
     private static void DrawMarker(Graphics graphics, Point point, Color color)

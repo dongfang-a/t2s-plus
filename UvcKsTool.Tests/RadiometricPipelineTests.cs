@@ -103,6 +103,17 @@ public sealed class RadiometricPipelineTests
         Assert.False(highRange.State.Dirty);
     }
 
+    [Fact]
+    public void Renderer_ChangesPixelColorsAcrossPalettes()
+    {
+        var frame = CreateRenderedFrame();
+
+        using var whiteHot = TemperaturePreviewRenderer.Render(frame, 0);
+        using var rainbow = TemperaturePreviewRenderer.Render(frame, 5);
+
+        Assert.NotEqual(whiteHot.GetPixel(8, 8).ToArgb(), rainbow.GetPixel(8, 8).ToArgb());
+    }
+
     private static RawFramePacket CreateRawFrame()
     {
         const int width = 256;
@@ -147,5 +158,36 @@ public sealed class RadiometricPipelineTests
     {
         var bytes = BitConverter.GetBytes(value);
         Buffer.BlockCopy(bytes, 0, buffer, offset, bytes.Length);
+    }
+
+    private static RadiometricFrame CreateRenderedFrame()
+    {
+        const int width = 16;
+        const int height = 16;
+        var temperatures = new float[width * height];
+        var rawCounts = new ushort[width * height];
+
+        for (var y = 0; y < height; y++)
+        {
+            for (var x = 0; x < width; x++)
+            {
+                var index = (y * width) + x;
+                temperatures[index] = 10f + x + (y * 1.5f);
+                rawCounts[index] = (ushort)(200 + index);
+            }
+        }
+
+        var search = SearchCore.Search(temperatures, rawCounts, width, height);
+
+        return new RadiometricFrame(
+            DateTimeOffset.Parse("2026-04-12T12:00:00Z"),
+            width,
+            height,
+            rawCounts,
+            temperatures,
+            search,
+            ThermometryParams.Default,
+            new CameraThermometryStateSnapshot(CameraThermometryState.NormalRangeMode, CameraThermometryState.DefaultCameraLens, 0f, false),
+            new FrameTailMetadata(ThermometryParams.Default, "test", new byte[128]));
     }
 }

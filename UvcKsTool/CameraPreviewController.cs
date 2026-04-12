@@ -29,6 +29,7 @@ internal sealed class CameraPreviewController : IDisposable
     private bool _parametersSeeded;
     private RawFramePacket? _latestPacket;
     private RadiometricFrame? _latestFrame;
+    private int _paletteIndex;
 
     public CameraPreviewController(PictureBox pictureBox, IThermometryDecoder? decoder = null)
     {
@@ -143,6 +144,14 @@ internal sealed class CameraPreviewController : IDisposable
     public CameraThermometryStateSnapshot GetStateSnapshot() => _state.Snapshot();
 
     public void RequestShutterRefresh() => _state.RequestRefresh();
+
+    public void UpdatePalette(int paletteIndex)
+    {
+        lock (_sync)
+        {
+            _paletteIndex = paletteIndex;
+        }
+    }
 
     public string ExportLatestCapture(string rootDirectory)
     {
@@ -270,7 +279,7 @@ internal sealed class CameraPreviewController : IDisposable
 
                 var activeParameters = ResolveActiveParameters(packet);
                 var decodedFrame = _decoder.Decode(packet, activeParameters, _state);
-                var previewBitmap = TemperaturePreviewRenderer.Render(decodedFrame);
+                var previewBitmap = TemperaturePreviewRenderer.Render(decodedFrame, GetPaletteIndex());
 
                 lock (_sync)
                 {
@@ -314,6 +323,14 @@ internal sealed class CameraPreviewController : IDisposable
             capture.Dispose();
             ClearPreview();
             StatusChanged?.Invoke("Measurement stopped.");
+        }
+    }
+
+    private int GetPaletteIndex()
+    {
+        lock (_sync)
+        {
+            return _paletteIndex;
         }
     }
 

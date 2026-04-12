@@ -54,6 +54,7 @@ internal sealed class MainForm : Form
     private bool _measurementEditorsInitializedFromFrame;
     private bool _measurementSettingsTouched;
     private bool _suppressMeasurementSettingEvents;
+    private int _selectedPaletteIndex;
 
     public MainForm()
     {
@@ -380,14 +381,17 @@ internal sealed class MainForm : Form
 
     private Control BuildPaletteContent()
     {
-        foreach (var option in PaletteOption.All)
+        if (_paletteComboBox.Items.Count == 0)
         {
-            _paletteComboBox.Items.Add(option);
+            foreach (var option in PaletteOption.All)
+            {
+                _paletteComboBox.Items.Add(option);
+            }
         }
 
         if (_paletteComboBox.Items.Count > 0)
         {
-            _paletteComboBox.SelectedIndex = 0;
+            _paletteComboBox.SelectedIndex = Math.Clamp(_selectedPaletteIndex, 0, _paletteComboBox.Items.Count - 1);
         }
 
         _paletteComboBox.DropDownStyle = ComboBoxStyle.DropDownList;
@@ -398,7 +402,7 @@ internal sealed class MainForm : Form
         {
             if (_paletteComboBox.SelectedItem is PaletteOption option)
             {
-                SendNamedCommand("palette", option.Index);
+                ApplyPalette(option);
             }
         };
 
@@ -651,6 +655,7 @@ internal sealed class MainForm : Form
             _previewController.FrameDecoded += OnMeasurementFrameDecoded;
 
             ApplyMeasurementSettings(forceLog: false);
+            _previewController.UpdatePalette(_selectedPaletteIndex);
             SendNamedCommand(device, "source-raw", null);
 
             _previewController.Start(device.Index);
@@ -952,6 +957,32 @@ internal sealed class MainForm : Form
             (float)_humidityEditor.Value,
             (float)_emissivityEditor.Value,
             (int)_distanceEditor.Value);
+
+    private void ApplyPalette(PaletteOption option)
+    {
+        _selectedPaletteIndex = option.Index;
+        _previewController?.UpdatePalette(option.Index);
+
+        var device = _deviceComboBox.SelectedItem as VideoDevice;
+        var localApplied = true;
+        var deviceApplied = device is not null && SendNamedCommand(device, "palette", option.Index);
+        if (device is null)
+        {
+            Log($"Preview palette set to {option.Name} for local measurement rendering.");
+            return;
+        }
+
+        if (localApplied && deviceApplied)
+        {
+            Log($"Applied palette {option.Name} to local preview and device.");
+            return;
+        }
+
+        if (localApplied)
+        {
+            Log($"Applied palette {option.Name} to local preview, but device command failed.");
+        }
+    }
 
     private void SendTemperaturePoint(int pointIndex)
     {

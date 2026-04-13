@@ -10,11 +10,11 @@ internal sealed class CameraPreviewController : IDisposable
     private const int ExpectedBytes = ExpectedWidth * ExpectedHeight * sizeof(ushort);
     private static readonly CaptureCandidate[] CaptureCandidates =
     [
+        new(VideoCaptureAPIs.MSMF, "Media Foundation", null),
+        new(VideoCaptureAPIs.MSMF, "Media Foundation + Y16 ", MakeFourCc('Y', '1', '6', ' ')),
         new(VideoCaptureAPIs.DSHOW, "DirectShow", null),
         new(VideoCaptureAPIs.DSHOW, "DirectShow + Y16 ", MakeFourCc('Y', '1', '6', ' ')),
         new(VideoCaptureAPIs.DSHOW, "DirectShow + YUY2", MakeFourCc('Y', 'U', 'Y', '2')),
-        new(VideoCaptureAPIs.MSMF, "Media Foundation", null),
-        new(VideoCaptureAPIs.MSMF, "Media Foundation + Y16 ", MakeFourCc('Y', '1', '6', ' ')),
         new(VideoCaptureAPIs.ANY, "OpenCV default", null)
     ];
 
@@ -56,17 +56,15 @@ internal sealed class CameraPreviewController : IDisposable
     {
         Stop();
 
-        var session = OpenCapture(deviceIndex);
         var cts = new CancellationTokenSource();
         Task loopTask;
 
         try
         {
-            loopTask = Task.Run(() => CaptureLoop(session.Capture, cts.Token), cts.Token);
+            loopTask = Task.Run(() => OpenAndCaptureLoop(deviceIndex, cts.Token), cts.Token);
         }
         catch
         {
-            session.Capture.Dispose();
             cts.Dispose();
             throw;
         }
@@ -76,8 +74,6 @@ internal sealed class CameraPreviewController : IDisposable
             _cts = cts;
             _loopTask = loopTask;
         }
-
-        StatusChanged?.Invoke($"Measurement started on camera index {deviceIndex} via {session.Description}.");
     }
 
     public void Stop()
@@ -254,6 +250,37 @@ internal sealed class CameraPreviewController : IDisposable
 
         description = "timed out waiting for a frame";
         return false;
+    }
+
+    private void OpenAndCaptureLoop(int deviceIndex, CancellationToken token)
+    {
+        try
+        {
+            token.ThrowIfCancellationRequested();
+            StatusChanged?.Invoke($"Opening measurement stream on camera index {deviceIndex}...");
+
+            var session = OpenCapture(deviceIndex);
+            if (token.IsCancellationRequested)
+            {
+                session.Capture.Release();
+                session.Capture.Dispose();
+                StatusChanged?.Invoke("Measurement stopped.");
+                return;
+            }
+
+            StatusChanged?.Invoke($"Measurement started on camera index {deviceIndex} via {session.Description}.");
+            CaptureLoop(session.Capture, token);
+        }
+        catch (OperationCanceledException)
+        {
+            StatusChanged?.Invoke("Measurement stopped.");
+        }
+        catch (Exception ex)
+        {
+            ClearPreview();
+            StatusChanged?.Invoke($"Measurement failed: {ex.Message}");
+            StatusChanged?.Invoke("Measurement stopped.");
+        }
     }
 
     private void CaptureLoop(VideoCapture capture, CancellationToken token)

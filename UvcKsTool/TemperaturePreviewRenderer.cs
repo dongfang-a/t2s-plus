@@ -43,6 +43,7 @@ internal static class TemperaturePreviewRenderer
         }
 
         using var graphics = Graphics.FromImage(bitmap);
+        DrawCrosshair(graphics, GetCenterPoint(frame), Color.Gold);
         DrawMarker(graphics, frame.MaxPoint, Color.Red);
         DrawMarker(graphics, frame.MinPoint, Color.DeepSkyBlue);
         return bitmap;
@@ -97,6 +98,22 @@ internal static class TemperaturePreviewRenderer
         var upperIndex = lowerIndex + 1;
         var localT = scaled - lowerIndex;
         return Blend(stops[lowerIndex], stops[upperIndex], localT);
+    }
+
+    private static Point GetCenterPoint(RadiometricFrame frame)
+    {
+        return new Point(frame.ThermalWidth / 2, frame.ThermalHeight / 2);
+    }
+
+    private static void DrawCrosshair(Graphics graphics, Point point, Color color)
+    {
+        const int innerGap = 3;
+        const int outerLength = 10;
+        using var pen = new Pen(color, 1.4f);
+        graphics.DrawLine(pen, point.X - outerLength, point.Y, point.X - innerGap, point.Y);
+        graphics.DrawLine(pen, point.X + innerGap, point.Y, point.X + outerLength, point.Y);
+        graphics.DrawLine(pen, point.X, point.Y - outerLength, point.X, point.Y - innerGap);
+        graphics.DrawLine(pen, point.X, point.Y + innerGap, point.X, point.Y + outerLength);
     }
 
     private static void DrawMarker(Graphics graphics, Point point, Color color)

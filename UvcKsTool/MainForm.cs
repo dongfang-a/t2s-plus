@@ -4,19 +4,13 @@ namespace UvcKsTool;
 
 internal sealed class MainForm : Form
 {
-    private static readonly string[] PointXCommands =
-    [
-        "temp-point1-x",
-        "temp-point2-x",
-        "temp-point3-x"
-    ];
-
-    private static readonly string[] PointYCommands =
-    [
-        "temp-point1-y",
-        "temp-point2-y",
-        "temp-point3-y"
-    ];
+    private const int ThermalPreviewWidth = 256;
+    private const int ThermalPreviewHeight = 192;
+    private const int BottomInfoRowHeight = 210;
+    private const int LiveMeasurementsTargetWidth = 650;
+    private const int MinimumLogWidth = 260;
+    private const int CommandSidebarWidth = 400;
+    private const int CommonCommandButtonRowHeight = 74;
 
     private readonly KsCommandSender _sender = new();
     private readonly ComboBox _deviceComboBox = new();
@@ -24,6 +18,9 @@ internal sealed class MainForm : Form
     private readonly Button _startMeasurementButton = new();
     private readonly Button _stopMeasurementButton = new();
     private readonly PictureBox _previewBox = new();
+    private readonly TableLayoutPanel _bottomInfoLayout = new();
+    private readonly Panel _previewViewportPanel = new();
+    private readonly Panel _previewHostPanel = new();
     private readonly TextBox _logTextBox = new();
     private readonly ComboBox _paletteComboBox = new();
     private readonly TextBox _rawCommandTextBox = new();
@@ -35,8 +32,6 @@ internal sealed class MainForm : Form
     private readonly Label _probeLabel = new();
     private readonly Label _frameInfoLabel = new();
     private readonly Label _versionLabel = new();
-    private readonly NumericUpDown[] _pointXEditors = new NumericUpDown[3];
-    private readonly NumericUpDown[] _pointYEditors = new NumericUpDown[3];
     private readonly NumericUpDown _fixEditor = CreateDecimalEditor(-50, 50, 0.1m, 2, 0);
     private readonly NumericUpDown _reflectedEditor = CreateDecimalEditor(-50, 500, 0.5m, 1, 20);
     private readonly NumericUpDown _ambientEditor = CreateDecimalEditor(-50, 500, 0.5m, 1, 20);
@@ -54,6 +49,8 @@ internal sealed class MainForm : Form
     private bool _measurementEditorsInitializedFromFrame;
     private bool _measurementSettingsTouched;
     private bool _suppressMeasurementSettingEvents;
+    private bool _paletteEventsWired;
+    private bool _suppressPaletteSelectionEvents;
     private int _selectedPaletteIndex;
 
     public MainForm()
@@ -62,12 +59,17 @@ internal sealed class MainForm : Form
         Font = new Font("Segoe UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
         Text = "UVC KS Tool";
         StartPosition = FormStartPosition.CenterScreen;
-        MinimumSize = new Size(1320, 820);
-        Size = new Size(1520, 980);
+        MinimumSize = new Size(1220, 820);
+        Size = new Size(1460, 940);
 
         InitializeLayout();
 
-        Load += (_, _) => RefreshDevices();
+        Load += (_, _) => RefreshDevices(autoStartMeasurement: true);
+        Shown += (_, _) =>
+        {
+            UpdatePreviewLayout();
+            UpdateBottomInfoLayout();
+        };
         FormClosed += (_, _) => _previewController?.Dispose();
     }
 
@@ -79,7 +81,7 @@ internal sealed class MainForm : Form
 
         _refreshButton.Text = "Refresh";
         _refreshButton.AutoSize = true;
-        _refreshButton.Click += (_, _) => RefreshDevices();
+        _refreshButton.Click += (_, _) => RefreshDevices(autoStartMeasurement: false);
 
         _startMeasurementButton.Text = "Start Measurement";
         _startMeasurementButton.AutoSize = true;
@@ -109,7 +111,14 @@ internal sealed class MainForm : Form
         topBar.Controls.Add(_stopMeasurementButton);
         topBar.Controls.Add(_previewLabel);
 
+        _previewViewportPanel.Dock = DockStyle.Fill;
+        _previewViewportPanel.BackColor = SystemColors.Control;
+        _previewViewportPanel.Resize += (_, _) => UpdatePreviewLayout();
+
+        _previewHostPanel.BackColor = SystemColors.Control;
+
         _previewBox.Dock = DockStyle.Fill;
+        _previewBox.Size = new Size(ThermalPreviewWidth, ThermalPreviewHeight);
         _previewBox.BackColor = Color.FromArgb(20, 20, 20);
         _previewBox.BorderStyle = BorderStyle.FixedSingle;
         _previewBox.SizeMode = PictureBoxSizeMode.Zoom;
@@ -120,6 +129,8 @@ internal sealed class MainForm : Form
             UpdateReadouts();
         };
         _previewBox.MouseClick += PreviewBoxOnMouseClick;
+        _previewHostPanel.Controls.Add(_previewBox);
+        _previewViewportPanel.Controls.Add(_previewHostPanel);
 
         var previewGroup = new GroupBox
         {
@@ -127,52 +138,15 @@ internal sealed class MainForm : Form
             Dock = DockStyle.Fill,
             Padding = new Padding(12)
         };
-        previewGroup.Controls.Add(_previewBox);
+        previewGroup.Controls.Add(_previewViewportPanel);
 
         var measurementSummaryGroup = new GroupBox
         {
             Text = "Live Measurements",
             Dock = DockStyle.Fill,
-            Padding = new Padding(10),
-            Height = 180
+            Padding = new Padding(10)
         };
         measurementSummaryGroup.Controls.Add(BuildMeasurementSummaryContent());
-
-        var leftPane = new TableLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            ColumnCount = 1,
-            RowCount = 2
-        };
-        leftPane.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
-        leftPane.RowStyles.Add(new RowStyle(SizeType.Absolute, 180F));
-        leftPane.Controls.Add(previewGroup, 0, 0);
-        leftPane.Controls.Add(measurementSummaryGroup, 0, 1);
-
-        var commandScrollPanel = new Panel
-        {
-            Dock = DockStyle.Fill,
-            AutoScroll = true,
-            Padding = new Padding(0, 0, 12, 0)
-        };
-
-        var commandStack = BuildCommandStack();
-        commandScrollPanel.Controls.Add(commandStack);
-        commandScrollPanel.Resize += (_, _) =>
-        {
-            commandStack.Width = Math.Max(420, commandScrollPanel.ClientSize.Width - 20);
-        };
-
-        var content = new TableLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            ColumnCount = 2,
-            Padding = new Padding(12, 0, 12, 8)
-        };
-        content.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-        content.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 460F));
-        content.Controls.Add(leftPane, 0, 0);
-        content.Controls.Add(commandScrollPanel, 1, 0);
 
         _logTextBox.Dock = DockStyle.Fill;
         _logTextBox.Multiline = true;
@@ -189,22 +163,130 @@ internal sealed class MainForm : Form
         };
         logGroup.Controls.Add(_logTextBox);
 
+        _bottomInfoLayout.Dock = DockStyle.Fill;
+        _bottomInfoLayout.ColumnCount = 2;
+        _bottomInfoLayout.RowCount = 1;
+        _bottomInfoLayout.Margin = new Padding(0);
+        _bottomInfoLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, LiveMeasurementsTargetWidth));
+        _bottomInfoLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        _bottomInfoLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+        _bottomInfoLayout.Resize += (_, _) => UpdateBottomInfoLayout();
+        _bottomInfoLayout.Controls.Add(measurementSummaryGroup, 0, 0);
+        _bottomInfoLayout.Controls.Add(logGroup, 1, 0);
+
+        var leftPane = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2
+        };
+        leftPane.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+        leftPane.RowStyles.Add(new RowStyle(SizeType.Absolute, BottomInfoRowHeight));
+        leftPane.Controls.Add(previewGroup, 0, 0);
+        leftPane.Controls.Add(_bottomInfoLayout, 0, 1);
+
+        var commandScrollPanel = new Panel
+        {
+            Dock = DockStyle.Fill,
+            AutoScroll = true,
+            Padding = new Padding(0, 0, 12, 0)
+        };
+
+        var commandStack = BuildCommandStack();
+        commandScrollPanel.Controls.Add(commandStack);
+        commandScrollPanel.Resize += (_, _) =>
+        {
+            commandStack.Width = Math.Max(360, commandScrollPanel.ClientSize.Width - 20);
+        };
+
+        var content = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+            Padding = new Padding(12, 0, 12, 8)
+        };
+        content.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        content.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, CommandSidebarWidth));
+        content.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+        content.Controls.Add(leftPane, 0, 0);
+        content.Controls.Add(commandScrollPanel, 1, 0);
+
         var root = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 3
+            RowCount = 2
         };
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 210F));
         root.Controls.Add(topBar, 0, 0);
         root.Controls.Add(content, 0, 1);
-        root.Controls.Add(logGroup, 0, 2);
 
         Controls.Add(root);
         UpdateReadouts();
         UpdateMeasurementButtons();
+    }
+
+    private void UpdatePreviewLayout()
+    {
+        if (_previewViewportPanel.IsDisposed || _previewHostPanel.IsDisposed || _previewBox.IsDisposed)
+        {
+            return;
+        }
+
+        var availableWidth = _previewViewportPanel.ClientSize.Width;
+        var availableHeight = _previewViewportPanel.ClientSize.Height;
+        if (availableWidth <= 0 || availableHeight <= 0)
+        {
+            return;
+        }
+
+        var nativeSize = GetPreviewNativeSize();
+        var scale = Math.Min(
+            availableWidth / (float)nativeSize.Width,
+            availableHeight / (float)nativeSize.Height);
+        var targetWidth = Math.Max(1, (int)Math.Round(nativeSize.Width * scale));
+        var targetHeight = Math.Max(1, (int)Math.Round(nativeSize.Height * scale));
+
+        _previewHostPanel.Size = new Size(targetWidth, targetHeight);
+        _previewHostPanel.Location = new Point(
+            Math.Max(0, (availableWidth - targetWidth) / 2),
+            Math.Max(0, (availableHeight - targetHeight) / 2));
+    }
+
+    private void UpdateBottomInfoLayout()
+    {
+        if (_bottomInfoLayout.IsDisposed || _bottomInfoLayout.ColumnStyles.Count < 2)
+        {
+            return;
+        }
+
+        var availableWidth = _bottomInfoLayout.ClientSize.Width;
+        if (availableWidth <= 0)
+        {
+            return;
+        }
+
+        var liveMeasurementsWidth = Math.Clamp(
+            availableWidth - MinimumLogWidth,
+            0,
+            LiveMeasurementsTargetWidth);
+
+        _bottomInfoLayout.ColumnStyles[0].SizeType = SizeType.Absolute;
+        _bottomInfoLayout.ColumnStyles[0].Width = liveMeasurementsWidth;
+        _bottomInfoLayout.ColumnStyles[1].SizeType = SizeType.Percent;
+        _bottomInfoLayout.ColumnStyles[1].Width = 100F;
+    }
+
+    private Size GetPreviewNativeSize()
+    {
+        if (_previewBox.Image is { Width: > 0, Height: > 0 } image)
+        {
+            return image.Size;
+        }
+
+        return new Size(ThermalPreviewWidth, ThermalPreviewHeight);
     }
 
     private Control BuildMeasurementSummaryContent()
@@ -217,7 +299,6 @@ internal sealed class MainForm : Form
         };
         table.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90F));
         table.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-
         AddSummaryRow(table, 0, "Center", _centerLabel);
         AddSummaryRow(table, 1, "Max", _maxLabel);
         AddSummaryRow(table, 2, "Min", _minLabel);
@@ -248,11 +329,9 @@ internal sealed class MainForm : Form
             Margin = new Padding(0)
         };
         stack.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        stack.Controls.Add(CreateSectionGroup("Palette", BuildPaletteContent()));
         stack.Controls.Add(CreateSectionGroup("Measurement", BuildMeasurementControlsContent()));
         stack.Controls.Add(CreateSectionGroup("Common Commands", BuildCommonCommandsContent()));
-        stack.Controls.Add(CreateSectionGroup("Legacy Follow-up", BuildLegacyFollowUpContent()));
-        stack.Controls.Add(CreateSectionGroup("Palette", BuildPaletteContent()));
-        stack.Controls.Add(CreateSectionGroup("Temperature Points", BuildTemperaturePointsContent()));
         stack.Controls.Add(CreateSectionGroup("Raw Command", BuildRawCommandContent()));
         stack.Controls.Add(CreateSectionGroup("Notes", BuildNotesContent()));
         return stack;
@@ -274,6 +353,53 @@ internal sealed class MainForm : Form
         return group;
     }
 
+    private Control BuildPaletteContent()
+    {
+        if (_paletteComboBox.Items.Count == 0)
+        {
+            foreach (var option in PaletteOption.All)
+            {
+                _paletteComboBox.Items.Add(option);
+            }
+        }
+
+        if (!_paletteEventsWired)
+        {
+            _paletteEventsWired = true;
+            _paletteComboBox.SelectedIndexChanged += (_, _) =>
+            {
+                if (_suppressPaletteSelectionEvents)
+                {
+                    return;
+                }
+
+                if (_paletteComboBox.SelectedItem is PaletteOption option)
+                {
+                    ApplyPalette(option);
+                }
+            };
+        }
+
+        _paletteComboBox.DropDownStyle = ComboBoxStyle.DropDownList;
+        _paletteComboBox.Width = 300;
+
+        if (_paletteComboBox.Items.Count > 0)
+        {
+            _suppressPaletteSelectionEvents = true;
+            _paletteComboBox.SelectedIndex = Math.Clamp(_selectedPaletteIndex, 0, _paletteComboBox.Items.Count - 1);
+            _suppressPaletteSelectionEvents = false;
+        }
+
+        var layout = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            WrapContents = true
+        };
+        layout.Controls.Add(_paletteComboBox);
+        return layout;
+    }
+
     private Control BuildMeasurementControlsContent()
     {
         InitializeMeasurementSelectors();
@@ -287,7 +413,6 @@ internal sealed class MainForm : Form
         };
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 130F));
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-
         AddMeasurementEditor(grid, 0, "Fix", _fixEditor);
         AddMeasurementEditor(grid, 1, "Reflected", _reflectedEditor);
         AddMeasurementEditor(grid, 2, "Ambient", _ambientEditor);
@@ -346,123 +471,13 @@ internal sealed class MainForm : Form
         layout.Controls.Add(editor, 1, rowIndex);
     }
 
-    private Control BuildCommonCommandsContent() =>
-        BuildButtonGrid(
-            ("Startup (0xA120)", "startup-newdemo"),
-            ("NUC / Shutter", "nuc"),
+    private Control BuildCommonCommandsContent()
+    {
+        return BuildButtonGrid(
             ("Source Raw", "source-raw"),
             ("Source YUV", "source-yuv"),
-            ("K-Table", "k-table"),
             ("Wide Dyn On", "wide-dynamic-on"),
             ("Wide Dyn Off", "wide-dynamic-off"));
-
-    private Control BuildLegacyFollowUpContent()
-    {
-        var layout = new TableLayoutPanel
-        {
-            AutoSize = true,
-            AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            ColumnCount = 1
-        };
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-
-        var commitButton = new Button { Text = "Commit Temp Points", AutoSize = true };
-        commitButton.Click += (_, _) => CommitTemperaturePoints();
-        layout.Controls.Add(commitButton, 0, 0);
-        layout.Controls.Add(new Label
-        {
-            AutoSize = true,
-            ForeColor = Color.DimGray,
-            Margin = new Padding(3, 8, 3, 0),
-            Text = "Runs the observed legacy follow-up sequence 0x8027 -> 0x80FE. Standalone 0x8027 is hidden because some devices reject it as an incomplete request."
-        }, 0, 1);
-        return layout;
-    }
-
-    private Control BuildPaletteContent()
-    {
-        if (_paletteComboBox.Items.Count == 0)
-        {
-            foreach (var option in PaletteOption.All)
-            {
-                _paletteComboBox.Items.Add(option);
-            }
-        }
-
-        if (_paletteComboBox.Items.Count > 0)
-        {
-            _paletteComboBox.SelectedIndex = Math.Clamp(_selectedPaletteIndex, 0, _paletteComboBox.Items.Count - 1);
-        }
-
-        _paletteComboBox.DropDownStyle = ComboBoxStyle.DropDownList;
-        _paletteComboBox.Width = 220;
-
-        var applyButton = new Button { Text = "Apply Palette", AutoSize = true };
-        applyButton.Click += (_, _) =>
-        {
-            if (_paletteComboBox.SelectedItem is PaletteOption option)
-            {
-                ApplyPalette(option);
-            }
-        };
-
-        var layout = new FlowLayoutPanel
-        {
-            AutoSize = true,
-            AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            WrapContents = true
-        };
-        layout.Controls.Add(_paletteComboBox);
-        layout.Controls.Add(applyButton);
-        return layout;
-    }
-
-    private Control BuildTemperaturePointsContent()
-    {
-        var layout = new TableLayoutPanel
-        {
-            AutoSize = true,
-            AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            ColumnCount = 4
-        };
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-
-        layout.Controls.Add(new Label { Text = "Point", AutoSize = true, Margin = new Padding(3, 6, 10, 0) }, 0, 0);
-        layout.Controls.Add(new Label { Text = "X", AutoSize = true, Margin = new Padding(3, 6, 10, 0) }, 1, 0);
-        layout.Controls.Add(new Label { Text = "Y", AutoSize = true, Margin = new Padding(3, 6, 10, 0) }, 2, 0);
-        layout.Controls.Add(new Label { Text = string.Empty, AutoSize = true }, 3, 0);
-
-        for (var i = 0; i < 3; i++)
-        {
-            _pointXEditors[i] = CreateCoordinateEditor();
-            _pointYEditors[i] = CreateCoordinateEditor();
-
-            var pointIndex = i;
-            var sendPointButton = new Button { Text = $"Send P{i + 1}", AutoSize = true };
-            sendPointButton.Click += (_, _) => SendTemperaturePoint(pointIndex);
-
-            layout.Controls.Add(new Label { Text = $"P{i + 1}", AutoSize = true, Margin = new Padding(3, 8, 10, 0) }, 0, i + 1);
-            layout.Controls.Add(_pointXEditors[i], 1, i + 1);
-            layout.Controls.Add(_pointYEditors[i], 2, i + 1);
-            layout.Controls.Add(sendPointButton, 3, i + 1);
-        }
-
-        var sendAllButton = new Button { Text = "Send All Points", AutoSize = true, Margin = new Padding(0, 10, 0, 0) };
-        sendAllButton.Click += (_, _) => SendAllTemperaturePoints();
-
-        var outer = new TableLayoutPanel
-        {
-            AutoSize = true,
-            AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            ColumnCount = 1
-        };
-        outer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-        outer.Controls.Add(layout, 0, 0);
-        outer.Controls.Add(sendAllButton, 0, 1);
-        return outer;
     }
 
     private Control BuildRawCommandContent()
@@ -503,31 +518,41 @@ internal sealed class MainForm : Form
         return layout;
     }
 
-    private static Control BuildNotesContent() =>
-        new Label
+    private static Control BuildNotesContent()
+    {
+        return new Label
         {
             AutoSize = true,
             ForeColor = Color.DimGray,
-            Text = "Measurement preview now uses raw 16-bit transport frames and a managed thermometry/search pipeline. KS buttons still send IKsControl requests through PROPSETID_VIDCAP_CAMERACONTROL / ZOOM / SET."
+            Text = "Measurement preview uses the raw 16-bit transport stream and a managed thermometry/search pipeline. CLI and raw command access are unchanged."
         };
+    }
 
     private Control BuildButtonGrid(params (string Text, string CommandName)[] buttons)
     {
+        var rowCount = Math.Max(1, (int)Math.Ceiling(buttons.Length / 2d));
         var layout = new TableLayoutPanel
         {
             AutoSize = true,
             AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            ColumnCount = 2
+            ColumnCount = 2,
+            RowCount = rowCount,
+            GrowStyle = TableLayoutPanelGrowStyle.FixedSize
         };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+
+        for (var rowIndex = 0; rowIndex < rowCount; rowIndex++)
+        {
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, CommonCommandButtonRowHeight));
+        }
 
         for (var i = 0; i < buttons.Length; i++)
         {
             var button = new Button
             {
                 Text = buttons[i].Text,
-                AutoSize = true,
+                AutoSize = false,
                 Dock = DockStyle.Fill,
                 Margin = new Padding(4)
             };
@@ -540,16 +565,9 @@ internal sealed class MainForm : Form
         return layout;
     }
 
-    private static NumericUpDown CreateCoordinateEditor() =>
-        new()
-        {
-            Minimum = 0,
-            Maximum = 255,
-            Width = 70
-        };
-
-    private static NumericUpDown CreateDecimalEditor(decimal minimum, decimal maximum, decimal increment, int decimalPlaces, decimal value) =>
-        new()
+    private static NumericUpDown CreateDecimalEditor(decimal minimum, decimal maximum, decimal increment, int decimalPlaces, decimal value)
+    {
+        return new NumericUpDown
         {
             Minimum = minimum,
             Maximum = maximum,
@@ -558,6 +576,7 @@ internal sealed class MainForm : Form
             Value = value,
             Width = 120
         };
+    }
 
     private void InitializeMeasurementSelectors()
     {
@@ -565,8 +584,8 @@ internal sealed class MainForm : Form
         {
             _rangeModeComboBox.DropDownStyle = ComboBoxStyle.DropDownList;
             _rangeModeComboBox.Width = 220;
-            _rangeModeComboBox.Items.Add(new RangeModeOption(CameraThermometryState.NormalRangeMode, "0x78 Normal (-20°C to 120°C)"));
-            _rangeModeComboBox.Items.Add(new RangeModeOption(CameraThermometryState.WideRangeMode, "0x190 Wide (120°C to 450°C)"));
+            _rangeModeComboBox.Items.Add(new RangeModeOption(CameraThermometryState.NormalRangeMode, "0x78 Normal (-20C to 120C)"));
+            _rangeModeComboBox.Items.Add(new RangeModeOption(CameraThermometryState.WideRangeMode, "0x190 Wide (120C to 450C)"));
             _rangeModeComboBox.SelectedIndex = 0;
         }
 
@@ -582,18 +601,28 @@ internal sealed class MainForm : Form
 
     private void WireMeasurementSettingEvents()
     {
-        _fixEditor.ValueChanged += (_, _) => OnMeasurementSettingEdited();
-        _reflectedEditor.ValueChanged += (_, _) => OnMeasurementSettingEdited();
-        _ambientEditor.ValueChanged += (_, _) => OnMeasurementSettingEdited();
-        _humidityEditor.ValueChanged += (_, _) => OnMeasurementSettingEdited();
-        _emissivityEditor.ValueChanged += (_, _) => OnMeasurementSettingEdited();
-        _distanceEditor.ValueChanged += (_, _) => OnMeasurementSettingEdited();
-        _shutterFixEditor.ValueChanged += (_, _) => OnMeasurementSettingEdited();
-        _rangeModeComboBox.SelectedIndexChanged += (_, _) => OnMeasurementSettingEdited();
-        _cameraLensComboBox.SelectedIndexChanged += (_, _) => OnMeasurementSettingEdited();
+        _fixEditor.ValueChanged -= OnMeasurementSettingEdited;
+        _reflectedEditor.ValueChanged -= OnMeasurementSettingEdited;
+        _ambientEditor.ValueChanged -= OnMeasurementSettingEdited;
+        _humidityEditor.ValueChanged -= OnMeasurementSettingEdited;
+        _emissivityEditor.ValueChanged -= OnMeasurementSettingEdited;
+        _distanceEditor.ValueChanged -= OnMeasurementSettingEdited;
+        _shutterFixEditor.ValueChanged -= OnMeasurementSettingEdited;
+        _rangeModeComboBox.SelectedIndexChanged -= OnMeasurementSettingEdited;
+        _cameraLensComboBox.SelectedIndexChanged -= OnMeasurementSettingEdited;
+
+        _fixEditor.ValueChanged += OnMeasurementSettingEdited;
+        _reflectedEditor.ValueChanged += OnMeasurementSettingEdited;
+        _ambientEditor.ValueChanged += OnMeasurementSettingEdited;
+        _humidityEditor.ValueChanged += OnMeasurementSettingEdited;
+        _emissivityEditor.ValueChanged += OnMeasurementSettingEdited;
+        _distanceEditor.ValueChanged += OnMeasurementSettingEdited;
+        _shutterFixEditor.ValueChanged += OnMeasurementSettingEdited;
+        _rangeModeComboBox.SelectedIndexChanged += OnMeasurementSettingEdited;
+        _cameraLensComboBox.SelectedIndexChanged += OnMeasurementSettingEdited;
     }
 
-    private void OnMeasurementSettingEdited()
+    private void OnMeasurementSettingEdited(object? sender, EventArgs e)
     {
         if (_suppressMeasurementSettingEvents)
         {
@@ -603,7 +632,7 @@ internal sealed class MainForm : Form
         _measurementSettingsTouched = true;
     }
 
-    private void RefreshDevices()
+    private void RefreshDevices(bool autoStartMeasurement)
     {
         try
         {
@@ -614,19 +643,27 @@ internal sealed class MainForm : Form
             _deviceComboBox.DataSource = devices;
             _deviceComboBox.DisplayMember = nameof(VideoDevice.DisplayText);
 
-            if (devices.Count > 0)
-            {
-                var selectedIndex = previousSelection is null
-                    ? 0
-                    : Math.Max(0, devices.FindIndex(device =>
-                        string.Equals(device.FriendlyName, previousSelection, StringComparison.OrdinalIgnoreCase)));
-
-                _deviceComboBox.SelectedIndex = selectedIndex;
-                Log($"Found {devices.Count} video device(s).");
-            }
-            else
+            if (devices.Count == 0)
             {
                 Log("No DirectShow video input devices found.");
+                UpdateMeasurementButtons();
+                return;
+            }
+
+            var preferredIndex = FindPreferredMeasurementDeviceIndex(devices);
+            var selectedIndex = ResolveSelectionIndex(devices, previousSelection, preferredIndex, autoStartMeasurement);
+            _deviceComboBox.SelectedIndex = selectedIndex;
+            Log($"Found {devices.Count} video device(s).");
+
+            if (autoStartMeasurement && preferredIndex >= 0 && !(_previewController?.IsRunning ?? false))
+            {
+                BeginInvoke((MethodInvoker)(() =>
+                {
+                    if (!(_previewController?.IsRunning ?? false))
+                    {
+                        StartMeasurement();
+                    }
+                }));
             }
 
             UpdateMeasurementButtons();
@@ -636,6 +673,47 @@ internal sealed class MainForm : Form
             Log($"Refresh failed: {ex.Message}");
             MessageBox.Show(this, ex.Message, "Refresh failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
+    }
+
+    private static int ResolveSelectionIndex(IReadOnlyList<VideoDevice> devices, string? previousSelection, int preferredIndex, bool autoStartMeasurement)
+    {
+        if (autoStartMeasurement && preferredIndex >= 0)
+        {
+            return preferredIndex;
+        }
+
+        if (previousSelection is not null)
+        {
+            for (var i = 0; i < devices.Count; i++)
+            {
+                if (string.Equals(devices[i].FriendlyName, previousSelection, StringComparison.OrdinalIgnoreCase))
+                {
+                    return i;
+                }
+            }
+        }
+
+        return 0;
+    }
+
+    private static int FindPreferredMeasurementDeviceIndex(IReadOnlyList<VideoDevice> devices)
+    {
+        for (var i = 0; i < devices.Count; i++)
+        {
+            if (IsT2SDevice(devices[i]))
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    private static bool IsT2SDevice(VideoDevice device)
+    {
+        return device.FriendlyName.Contains("T2S+", StringComparison.OrdinalIgnoreCase)
+            || device.FriendlyName.Contains("T2S Plus", StringComparison.OrdinalIgnoreCase)
+            || device.FriendlyName.Contains("Xinfrared T2S", StringComparison.OrdinalIgnoreCase);
     }
 
     private void StartMeasurement()
@@ -659,7 +737,7 @@ internal sealed class MainForm : Form
             SendNamedCommand(device, "source-raw", null);
 
             _previewController.Start(device.Index);
-            _previewLabel.Text = $"Measurement running: {device.DisplayText}";
+            _previewLabel.Text = $"Measurement starting: {device.DisplayText}";
             UpdateMeasurementButtons();
         }
         catch (Exception ex)
@@ -750,6 +828,18 @@ internal sealed class MainForm : Form
         }
 
         Log(message);
+        if (message.StartsWith("Measurement started on camera index", StringComparison.OrdinalIgnoreCase))
+        {
+            if (_deviceComboBox.SelectedItem is VideoDevice device)
+            {
+                _previewLabel.Text = $"Measurement running: {device.DisplayText}";
+            }
+            else
+            {
+                _previewLabel.Text = "Measurement running.";
+            }
+        }
+
         if (!(_previewController?.IsRunning ?? false))
         {
             _previewLabel.Text = "Measurement stopped.";
@@ -772,6 +862,7 @@ internal sealed class MainForm : Form
             SynchronizeMeasurementEditors(frame);
         }
 
+        UpdatePreviewLayout();
         UpdateReadouts();
     }
 
@@ -824,8 +915,10 @@ internal sealed class MainForm : Form
         }
     }
 
-    private static decimal ClampEditorValue(NumericUpDown editor, decimal value) =>
-        Math.Min(editor.Maximum, Math.Max(editor.Minimum, value));
+    private static decimal ClampEditorValue(NumericUpDown editor, decimal value)
+    {
+        return Math.Min(editor.Maximum, Math.Max(editor.Minimum, value));
+    }
 
     private void UpdateMeasurementButtons()
     {
@@ -838,19 +931,19 @@ internal sealed class MainForm : Form
     {
         if (_latestFrame is null)
         {
-            _centerLabel.Text = "—";
-            _maxLabel.Text = "—";
-            _minLabel.Text = "—";
-            _hoverLabel.Text = "—";
-            _probeLabel.Text = "—";
+            _centerLabel.Text = "-";
+            _maxLabel.Text = "-";
+            _minLabel.Text = "-";
+            _hoverLabel.Text = "-";
+            _probeLabel.Text = "-";
             _frameInfoLabel.Text = "Waiting for a raw frame.";
-            _versionLabel.Text = "—";
+            _versionLabel.Text = "-";
             return;
         }
 
-        _centerLabel.Text = $"{_latestFrame.CenterTemp:F1} °C";
-        _maxLabel.Text = $"{_latestFrame.MaxTemp:F1} °C @ ({_latestFrame.MaxPoint.X}, {_latestFrame.MaxPoint.Y})";
-        _minLabel.Text = $"{_latestFrame.MinTemp:F1} °C @ ({_latestFrame.MinPoint.X}, {_latestFrame.MinPoint.Y})";
+        _centerLabel.Text = $"{_latestFrame.CenterTemp:F1} C";
+        _maxLabel.Text = $"{_latestFrame.MaxTemp:F1} C @ ({_latestFrame.MaxPoint.X}, {_latestFrame.MaxPoint.Y})";
+        _minLabel.Text = $"{_latestFrame.MinTemp:F1} C @ ({_latestFrame.MinPoint.X}, {_latestFrame.MinPoint.Y})";
         _hoverLabel.Text = FormatPointTemperature(_hoverPoint, "Move over the image");
         _probeLabel.Text = FormatPointTemperature(_lockedProbePoint, "Click the image to lock a probe");
         _frameInfoLabel.Text =
@@ -872,7 +965,7 @@ internal sealed class MainForm : Form
             return fallback;
         }
 
-        return $"{temperature:F1} °C @ ({point.Value.X}, {point.Value.Y})";
+        return $"{temperature:F1} C @ ({point.Value.X}, {point.Value.Y})";
     }
 
     private bool TryGetTemperature(Point point, out float temperature)
@@ -949,14 +1042,16 @@ internal sealed class MainForm : Form
         return new Rectangle(x, y, drawWidth, drawHeight);
     }
 
-    private ThermometryParams ReadMeasurementParams() =>
-        new(
+    private ThermometryParams ReadMeasurementParams()
+    {
+        return new ThermometryParams(
             (float)_fixEditor.Value,
             (float)_reflectedEditor.Value,
             (float)_ambientEditor.Value,
             (float)_humidityEditor.Value,
             (float)_emissivityEditor.Value,
             (int)_distanceEditor.Value);
+    }
 
     private void ApplyPalette(PaletteOption option)
     {
@@ -964,7 +1059,6 @@ internal sealed class MainForm : Form
         _previewController?.UpdatePalette(option.Index);
 
         var device = _deviceComboBox.SelectedItem as VideoDevice;
-        var localApplied = true;
         var deviceApplied = device is not null && SendNamedCommand(device, "palette", option.Index);
         if (device is null)
         {
@@ -972,88 +1066,13 @@ internal sealed class MainForm : Form
             return;
         }
 
-        if (localApplied && deviceApplied)
+        if (deviceApplied)
         {
             Log($"Applied palette {option.Name} to local preview and device.");
             return;
         }
 
-        if (localApplied)
-        {
-            Log($"Applied palette {option.Name} to local preview, but device command failed.");
-        }
-    }
-
-    private void SendTemperaturePoint(int pointIndex)
-    {
-        if (pointIndex < 0 || pointIndex >= 3)
-        {
-            return;
-        }
-
-        var device = GetSelectedDevice();
-        if (device is null)
-        {
-            return;
-        }
-
-        var x = (int)_pointXEditors[pointIndex].Value;
-        var y = (int)_pointYEditors[pointIndex].Value;
-        SendTemperaturePoint(device, pointIndex, x, y, includeLegacyCommit: true);
-    }
-
-    private void SendAllTemperaturePoints()
-    {
-        var device = GetSelectedDevice();
-        if (device is null)
-        {
-            return;
-        }
-
-        for (var i = 0; i < 3; i++)
-        {
-            var x = (int)_pointXEditors[i].Value;
-            var y = (int)_pointYEditors[i].Value;
-            if (!SendTemperaturePoint(device, i, x, y, includeLegacyCommit: false))
-            {
-                return;
-            }
-        }
-
-        SendTemperatureCommitSequence(device);
-    }
-
-    private bool SendTemperaturePoint(VideoDevice device, int pointIndex, int x, int y, bool includeLegacyCommit)
-    {
-        if (!SendNamedCommand(device, PointXCommands[pointIndex], x))
-        {
-            return false;
-        }
-
-        if (!SendNamedCommand(device, PointYCommands[pointIndex], y))
-        {
-            return false;
-        }
-
-        return !includeLegacyCommit || SendTemperatureCommitSequence(device);
-    }
-
-    private void CommitTemperaturePoints()
-    {
-        var device = GetSelectedDevice();
-        if (device is null)
-        {
-            return;
-        }
-
-        SendTemperatureCommitSequence(device);
-    }
-
-    private bool SendTemperatureCommitSequence(VideoDevice device)
-    {
-        Log($"[{device.DisplayText}] commit-temp-points => 0x8027 then 0x80FE");
-        return SendNamedCommand(device, "legacy-39", null)
-            && SendNamedCommand(device, "legacy-apply", null);
+        Log($"Applied palette {option.Name} to local preview, but device command failed.");
     }
 
     private bool SendNamedCommand(string commandName, int? value = null)

@@ -15,6 +15,19 @@ internal sealed record RawFramePacket(
     byte[] RawBytes,
     RawTransportFormat TransportFormat);
 
+internal enum CaptureSourceMode
+{
+    Raw = 0,
+    Yuv = 1,
+    KTable = 2
+}
+
+internal enum ThermometryAlgorithmMode
+{
+    Native = 0,
+    Legacy = 1
+}
+
 internal sealed record ThermometryParams(
     float Fix,
     float ReflectedTemp,
@@ -29,6 +42,7 @@ internal sealed record ThermometryParams(
 internal readonly record struct CameraThermometryStateSnapshot(
     int RangeMode,
     int CameraLens,
+    ThermometryAlgorithmMode AlgorithmMode,
     float ShutterFix,
     bool Dirty);
 
@@ -43,6 +57,7 @@ internal sealed class CameraThermometryState
 
     private int _rangeMode = NormalRangeMode;
     private int _cameraLens = DefaultCameraLens;
+    private ThermometryAlgorithmMode _algorithmMode = ThermometryAlgorithmMode.Native;
     private float _shutterFix;
     private bool _dirty = true;
 
@@ -50,7 +65,7 @@ internal sealed class CameraThermometryState
     {
         lock (_sync)
         {
-            return new CameraThermometryStateSnapshot(_rangeMode, _cameraLens, _shutterFix, _dirty);
+            return new CameraThermometryStateSnapshot(_rangeMode, _cameraLens, _algorithmMode, _shutterFix, _dirty);
         }
     }
 
@@ -68,6 +83,15 @@ internal sealed class CameraThermometryState
         lock (_sync)
         {
             _cameraLens = cameraLens;
+            _dirty = true;
+        }
+    }
+
+    public void UpdateAlgorithmMode(ThermometryAlgorithmMode algorithmMode)
+    {
+        lock (_sync)
+        {
+            _algorithmMode = algorithmMode;
             _dirty = true;
         }
     }
@@ -113,6 +137,45 @@ internal sealed record TemperatureSearchResult(
     public const int HeaderLength = 10;
 }
 
+internal enum ThermometryDecodePath
+{
+    NativeLookup = 0,
+    LegacyFallback = 1
+}
+
+internal enum NativeCalibrationKind
+{
+    KTable = 0,
+    Shutter = 1
+}
+
+internal readonly record struct NativeCalibrationEvent(
+    NativeCalibrationKind Kind,
+    string Message);
+
+internal sealed record ThermometryDecodeInfo(
+    ThermometryDecodePath Path,
+    string Reason)
+{
+    public bool UsedFallback => Path == ThermometryDecodePath.LegacyFallback;
+
+    public string DisplayText => Path switch
+    {
+        ThermometryDecodePath.LegacyFallback => $"legacy fallback ({Reason})",
+        _ when string.IsNullOrWhiteSpace(Reason) => "native LUT",
+        _ => $"native LUT ({Reason})"
+    };
+
+    public static ThermometryDecodeInfo NativeLookup { get; } =
+        new(ThermometryDecodePath.NativeLookup, string.Empty);
+
+    public static ThermometryDecodeInfo CreateNativeLookup(string reason) =>
+        new(ThermometryDecodePath.NativeLookup, reason);
+
+    public static ThermometryDecodeInfo CreateLegacyFallback(string reason) =>
+        new(ThermometryDecodePath.LegacyFallback, reason);
+}
+
 internal sealed record RadiometricFrame(
     DateTimeOffset Timestamp,
     int ThermalWidth,
@@ -122,7 +185,8 @@ internal sealed record RadiometricFrame(
     TemperatureSearchResult Search,
     ThermometryParams ActiveParameters,
     CameraThermometryStateSnapshot State,
-    FrameTailMetadata TailMetadata)
+    FrameTailMetadata TailMetadata,
+    ThermometryDecodeInfo DecodeInfo)
 {
     public float[] Header => Search.Header;
     public float CenterTemp => Header[0];
@@ -135,4 +199,15 @@ internal sealed record RadiometricFrame(
 internal interface IThermometryDecoder
 {
     RadiometricFrame Decode(RawFramePacket packet, ThermometryParams parameters, CameraThermometryState state);
+}
+
+internal interface INativeCalibrationController
+{
+    void UpdateSourceMode(CaptureSourceMode mode);
+
+    void BeginKTableCapture();
+
+    void BeginShutterCapture();
+
+    bool TryDequeueCalibrationEvent(out NativeCalibrationEvent calibrationEvent);
 }

@@ -28,6 +28,7 @@ internal static class DebugCaptureExporter
             frame.ThermalHeight,
             frame.ActiveParameters,
             frame.State,
+            frame.DecodeInfo,
             frame.TailMetadata.ProductVersion,
             frame.TailMetadata.EmbeddedParameters,
             Header = frame.Header,

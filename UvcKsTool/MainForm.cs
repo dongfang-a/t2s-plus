@@ -39,6 +39,7 @@ internal sealed class MainForm : Form
     private readonly NumericUpDown _emissivityEditor = CreateDecimalEditor(0.10m, 1.00m, 0.01m, 2, 0.95m);
     private readonly NumericUpDown _distanceEditor = CreateDecimalEditor(0, 5000, 1m, 0, 1);
     private readonly NumericUpDown _shutterFixEditor = CreateDecimalEditor(-50, 50, 0.1m, 2, 0);
+    private readonly ComboBox _algorithmComboBox = new();
     private readonly ComboBox _rangeModeComboBox = new();
     private readonly ComboBox _cameraLensComboBox = new();
 
@@ -52,6 +53,7 @@ internal sealed class MainForm : Form
     private bool _paletteEventsWired;
     private bool _suppressPaletteSelectionEvents;
     private int _selectedPaletteIndex;
+    private string? _lastDecoderStatusText;
 
     public MainForm()
     {
@@ -420,14 +422,18 @@ internal sealed class MainForm : Form
         AddMeasurementEditor(grid, 4, "Emissivity", _emissivityEditor);
         AddMeasurementEditor(grid, 5, "Distance", _distanceEditor);
         AddMeasurementEditor(grid, 6, "Shutter Fix", _shutterFixEditor);
-        AddMeasurementEditor(grid, 7, "Range Mode", _rangeModeComboBox);
-        AddMeasurementEditor(grid, 8, "Camera Lens", _cameraLensComboBox);
+        AddMeasurementEditor(grid, 7, "Algorithm", _algorithmComboBox);
+        AddMeasurementEditor(grid, 8, "Range Mode", _rangeModeComboBox);
+        AddMeasurementEditor(grid, 9, "Camera Lens", _cameraLensComboBox);
 
         var applyButton = new Button { Text = "Apply Settings", AutoSize = true };
         applyButton.Click += (_, _) => ApplyMeasurementSettings(forceLog: true);
 
         var refreshButton = new Button { Text = "Shutter / NUC Refresh", AutoSize = true };
         refreshButton.Click += (_, _) => RequestMeasurementRefresh();
+
+        var captureKTableButton = new Button { Text = "Capture K Table", AutoSize = true };
+        captureKTableButton.Click += (_, _) => CaptureKTable();
 
         var exportButton = new Button { Text = "Export Debug", AutoSize = true };
         exportButton.Click += (_, _) => ExportDebugCapture();
@@ -441,6 +447,7 @@ internal sealed class MainForm : Form
         };
         actions.Controls.Add(applyButton);
         actions.Controls.Add(refreshButton);
+        actions.Controls.Add(captureKTableButton);
         actions.Controls.Add(exportButton);
 
         var note = new Label
@@ -448,7 +455,7 @@ internal sealed class MainForm : Form
             AutoSize = true,
             ForeColor = Color.DimGray,
             Margin = new Padding(0, 8, 0, 0),
-            Text = "This mode consumes raw 256x196 transport frames, parses the 128-byte tail block, computes a managed temperature field, and renders preview from the decoded temperatures."
+            Text = "This mode consumes raw 256x196 transport frames, parses the tail block, and lets you switch between native and legacy thermometry. Capture K table plus a shutter refresh to enable calibrated native preprocessing."
         };
 
         var outer = new TableLayoutPanel
@@ -580,6 +587,15 @@ internal sealed class MainForm : Form
 
     private void InitializeMeasurementSelectors()
     {
+        if (_algorithmComboBox.Items.Count == 0)
+        {
+            _algorithmComboBox.DropDownStyle = ComboBoxStyle.DropDownList;
+            _algorithmComboBox.Width = 220;
+            _algorithmComboBox.Items.Add(new AlgorithmModeOption(ThermometryAlgorithmMode.Native, "Native"));
+            _algorithmComboBox.Items.Add(new AlgorithmModeOption(ThermometryAlgorithmMode.Legacy, "Legacy"));
+            _algorithmComboBox.SelectedIndex = 0;
+        }
+
         if (_rangeModeComboBox.Items.Count == 0)
         {
             _rangeModeComboBox.DropDownStyle = ComboBoxStyle.DropDownList;
@@ -608,6 +624,7 @@ internal sealed class MainForm : Form
         _emissivityEditor.ValueChanged -= OnMeasurementSettingEdited;
         _distanceEditor.ValueChanged -= OnMeasurementSettingEdited;
         _shutterFixEditor.ValueChanged -= OnMeasurementSettingEdited;
+        _algorithmComboBox.SelectedIndexChanged -= OnAlgorithmModeChanged;
         _rangeModeComboBox.SelectedIndexChanged -= OnMeasurementSettingEdited;
         _cameraLensComboBox.SelectedIndexChanged -= OnMeasurementSettingEdited;
 
@@ -618,6 +635,7 @@ internal sealed class MainForm : Form
         _emissivityEditor.ValueChanged += OnMeasurementSettingEdited;
         _distanceEditor.ValueChanged += OnMeasurementSettingEdited;
         _shutterFixEditor.ValueChanged += OnMeasurementSettingEdited;
+        _algorithmComboBox.SelectedIndexChanged += OnAlgorithmModeChanged;
         _rangeModeComboBox.SelectedIndexChanged += OnMeasurementSettingEdited;
         _cameraLensComboBox.SelectedIndexChanged += OnMeasurementSettingEdited;
     }
@@ -630,6 +648,16 @@ internal sealed class MainForm : Form
         }
 
         _measurementSettingsTouched = true;
+    }
+
+    private void OnAlgorithmModeChanged(object? sender, EventArgs e)
+    {
+        if (_suppressMeasurementSettingEvents)
+        {
+            return;
+        }
+
+        ApplyAlgorithmSelection(forceLog: true);
     }
 
     private void RefreshDevices(bool autoStartMeasurement)
@@ -726,14 +754,19 @@ internal sealed class MainForm : Form
 
         try
         {
+            _lastDecoderStatusText = null;
             _previewController ??= new CameraPreviewController(_previewBox);
             _previewController.StatusChanged -= OnPreviewStatusChanged;
             _previewController.FrameDecoded -= OnMeasurementFrameDecoded;
+            _previewController.CalibrationCaptured -= OnCalibrationCaptured;
             _previewController.StatusChanged += OnPreviewStatusChanged;
             _previewController.FrameDecoded += OnMeasurementFrameDecoded;
+            _previewController.CalibrationCaptured += OnCalibrationCaptured;
 
             ApplyMeasurementSettings(forceLog: false);
+            ApplyAlgorithmSelection(forceLog: false);
             _previewController.UpdatePalette(_selectedPaletteIndex);
+            _previewController.UpdateSourceMode(CaptureSourceMode.Raw);
             SendNamedCommand(device, "source-raw", null);
 
             _previewController.Start(device.Index);
@@ -750,6 +783,7 @@ internal sealed class MainForm : Form
     private void StopMeasurement()
     {
         _previewController?.Stop();
+        _lastDecoderStatusText = null;
         _previewLabel.Text = "Measurement stopped.";
         UpdateMeasurementButtons();
     }
@@ -779,10 +813,22 @@ internal sealed class MainForm : Form
         if (forceLog)
         {
             var parameters = ReadMeasurementParams();
+            var algorithmMode = ReadAlgorithmMode();
             var rangeValue = (_rangeModeComboBox.SelectedItem as RangeModeOption)?.Value ?? CameraThermometryState.NormalRangeMode;
             var lensValue = (_cameraLensComboBox.SelectedItem as CameraLensOption)?.Value ?? CameraThermometryState.DefaultCameraLens;
             Log(
-                $"Measurement settings staged: fix={parameters.Fix:F2}, refl={parameters.ReflectedTemp:F1}, air={parameters.AmbientTemp:F1}, humi={parameters.Humidity:F1}, emiss={parameters.Emissivity:F2}, dist={parameters.Distance}, shutterFix={(float)_shutterFixEditor.Value:F2}, range=0x{rangeValue:X}, lens=0x{lensValue:X}");
+                $"Measurement settings staged: fix={parameters.Fix:F2}, refl={parameters.ReflectedTemp:F1}, air={parameters.AmbientTemp:F1}, humi={parameters.Humidity:F1}, emiss={parameters.Emissivity:F2}, dist={parameters.Distance}, shutterFix={(float)_shutterFixEditor.Value:F2}, algorithm={algorithmMode}, range=0x{rangeValue:X}, lens=0x{lensValue:X}");
+        }
+    }
+
+    private void ApplyAlgorithmSelection(bool forceLog)
+    {
+        var algorithmMode = ReadAlgorithmMode();
+        _previewController?.UpdateAlgorithmMode(algorithmMode);
+
+        if (forceLog)
+        {
+            Log($"Measurement algorithm selected: {algorithmMode}.");
         }
     }
 
@@ -794,9 +840,38 @@ internal sealed class MainForm : Form
             return;
         }
 
-        SendNamedCommand(device, "nuc", null);
-        _previewController?.RequestShutterRefresh();
-        Log("Measurement refresh requested.");
+        if (SendNamedCommand(device, "nuc", null))
+        {
+            _previewController?.BeginShutterCapture();
+            _previewController?.RequestShutterRefresh();
+            Log("Measurement refresh requested; capturing shutter reference.");
+        }
+    }
+
+    private void CaptureKTable()
+    {
+        var device = GetSelectedDevice();
+        if (device is null)
+        {
+            return;
+        }
+
+        if (!(_previewController?.IsRunning ?? false))
+        {
+            MessageBox.Show(this, "Start measurement first so the K table frame can be captured.", "Measurement not running", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        _previewController?.BeginKTableCapture();
+        _previewController?.UpdateSourceMode(CaptureSourceMode.KTable);
+
+        if (SendNamedCommand(device, "k-table", null))
+        {
+            Log("K table capture armed; waiting for the next calibration frame.");
+            return;
+        }
+
+        _previewController?.UpdateSourceMode(CaptureSourceMode.Raw);
     }
 
     private void ExportDebugCapture()
@@ -857,6 +932,7 @@ internal sealed class MainForm : Form
         }
 
         _latestFrame = frame;
+        LogDecodeInfo(frame);
         if (!_measurementEditorsInitializedFromFrame)
         {
             SynchronizeMeasurementEditors(frame);
@@ -864,6 +940,36 @@ internal sealed class MainForm : Form
 
         UpdatePreviewLayout();
         UpdateReadouts();
+    }
+
+    private void OnCalibrationCaptured(NativeCalibrationEvent calibrationEvent)
+    {
+        if (InvokeRequired)
+        {
+            BeginInvoke((MethodInvoker)(() => OnCalibrationCaptured(calibrationEvent)));
+            return;
+        }
+
+        if (calibrationEvent.Kind != NativeCalibrationKind.KTable)
+        {
+            return;
+        }
+
+        var device = GetSelectedDevice();
+        if (device is null)
+        {
+            _previewController?.UpdateSourceMode(CaptureSourceMode.Raw);
+            return;
+        }
+
+        if (SendNamedCommand(device, "source-raw", null))
+        {
+            _previewController?.UpdateSourceMode(CaptureSourceMode.Raw);
+            Log("Returned to raw stream after K table capture.");
+            return;
+        }
+
+        Log("K table captured, but switching back to raw stream failed.");
     }
 
     private void SynchronizeMeasurementEditors(RadiometricFrame frame)
@@ -878,6 +984,7 @@ internal sealed class MainForm : Form
             _emissivityEditor.Value = ClampEditorValue(_emissivityEditor, (decimal)frame.ActiveParameters.Emissivity);
             _distanceEditor.Value = ClampEditorValue(_distanceEditor, frame.ActiveParameters.Distance);
             _shutterFixEditor.Value = ClampEditorValue(_shutterFixEditor, (decimal)frame.State.ShutterFix);
+            SelectAlgorithmMode(frame.State.AlgorithmMode);
             SelectRangeMode(frame.State.RangeMode);
             SelectCameraLens(frame.State.CameraLens);
         }
@@ -898,6 +1005,18 @@ internal sealed class MainForm : Form
             if (_rangeModeComboBox.Items[i] is RangeModeOption option && option.Value == value)
             {
                 _rangeModeComboBox.SelectedIndex = i;
+                return;
+            }
+        }
+    }
+
+    private void SelectAlgorithmMode(ThermometryAlgorithmMode value)
+    {
+        for (var i = 0; i < _algorithmComboBox.Items.Count; i++)
+        {
+            if (_algorithmComboBox.Items[i] is AlgorithmModeOption option && option.Value == value)
+            {
+                _algorithmComboBox.SelectedIndex = i;
                 return;
             }
         }
@@ -947,10 +1066,24 @@ internal sealed class MainForm : Form
         _hoverLabel.Text = FormatPointTemperature(_hoverPoint, "Move over the image");
         _probeLabel.Text = FormatPointTemperature(_lockedProbePoint, "Click the image to lock a probe");
         _frameInfoLabel.Text =
-            $"{_latestFrame.ThermalWidth}x{_latestFrame.ThermalHeight}, header[7/8]={_latestFrame.Header[7]:F0}/{_latestFrame.Header[8]:F0}, range=0x{_latestFrame.State.RangeMode:X}, lens=0x{_latestFrame.State.CameraLens:X}, dirty={_latestFrame.State.Dirty}";
+            $"{_latestFrame.ThermalWidth}x{_latestFrame.ThermalHeight}, header[7/8]={_latestFrame.Header[7]:F0}/{_latestFrame.Header[8]:F0}, algorithm={_latestFrame.State.AlgorithmMode}, range=0x{_latestFrame.State.RangeMode:X}, lens=0x{_latestFrame.State.CameraLens:X}, dirty={_latestFrame.State.Dirty}, decoder={_latestFrame.DecodeInfo.DisplayText}";
         _versionLabel.Text = string.IsNullOrWhiteSpace(_latestFrame.TailMetadata.ProductVersion)
             ? "<unavailable>"
             : _latestFrame.TailMetadata.ProductVersion;
+    }
+
+    private void LogDecodeInfo(RadiometricFrame frame)
+    {
+        var decoderStatus = $"algorithm={frame.State.AlgorithmMode}, decoder={frame.DecodeInfo.DisplayText}";
+        if (string.Equals(_lastDecoderStatusText, decoderStatus, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        _lastDecoderStatusText = decoderStatus;
+        Log(frame.DecodeInfo.UsedFallback
+            ? $"Decoder switched to {decoderStatus}."
+            : $"Decoder using {decoderStatus}.");
     }
 
     private string FormatPointTemperature(Point? point, string fallback)
@@ -1053,6 +1186,9 @@ internal sealed class MainForm : Form
             (int)_distanceEditor.Value);
     }
 
+    private ThermometryAlgorithmMode ReadAlgorithmMode() =>
+        (_algorithmComboBox.SelectedItem as AlgorithmModeOption)?.Value ?? ThermometryAlgorithmMode.Native;
+
     private void ApplyPalette(PaletteOption option)
     {
         _selectedPaletteIndex = option.Index;
@@ -1101,7 +1237,13 @@ internal sealed class MainForm : Form
             return false;
         }
 
-        return SendCommand(device, command.Name, resolvedValue, command.Pattern);
+        var succeeded = SendCommand(device, command.Name, resolvedValue, command.Pattern);
+        if (succeeded)
+        {
+            SynchronizeSourceMode(command.Name);
+        }
+
+        return succeeded;
     }
 
     private void SendRawCommand()
@@ -1138,6 +1280,27 @@ internal sealed class MainForm : Form
             Log($"Command send failed: {ex.Message}");
             MessageBox.Show(this, ex.Message, "Command send failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return false;
+        }
+    }
+
+    private void SynchronizeSourceMode(string commandName)
+    {
+        if (_previewController is null)
+        {
+            return;
+        }
+
+        switch (commandName)
+        {
+            case "source-raw":
+                _previewController.UpdateSourceMode(CaptureSourceMode.Raw);
+                break;
+            case "source-yuv":
+                _previewController.UpdateSourceMode(CaptureSourceMode.Yuv);
+                break;
+            case "k-table":
+                _previewController.UpdateSourceMode(CaptureSourceMode.KTable);
+                break;
         }
     }
 
@@ -1203,6 +1366,11 @@ internal sealed class MainForm : Form
         ];
 
         public override string ToString() => Name;
+    }
+
+    private sealed record AlgorithmModeOption(ThermometryAlgorithmMode Value, string Label)
+    {
+        public override string ToString() => Label;
     }
 
     private sealed record RangeModeOption(int Value, string Label)

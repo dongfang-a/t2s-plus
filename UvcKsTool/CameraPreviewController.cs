@@ -52,6 +52,8 @@ internal sealed class CameraPreviewController : IDisposable
 
     public event Action<RadiometricFrame>? FrameDecoded;
 
+    public event Action<NativeCalibrationEvent>? CalibrationCaptured;
+
     public void Start(int deviceIndex)
     {
         Stop();
@@ -135,7 +137,33 @@ internal sealed class CameraPreviewController : IDisposable
 
     public void UpdateCameraLens(int cameraLens) => _state.UpdateCameraLens(cameraLens);
 
+    public void UpdateAlgorithmMode(ThermometryAlgorithmMode algorithmMode) => _state.UpdateAlgorithmMode(algorithmMode);
+
     public void UpdateShutterFix(float shutterFix) => _state.UpdateShutterFix(shutterFix);
+
+    public void UpdateSourceMode(CaptureSourceMode mode)
+    {
+        if (_decoder is INativeCalibrationController calibrationController)
+        {
+            calibrationController.UpdateSourceMode(mode);
+        }
+    }
+
+    public void BeginKTableCapture()
+    {
+        if (_decoder is INativeCalibrationController calibrationController)
+        {
+            calibrationController.BeginKTableCapture();
+        }
+    }
+
+    public void BeginShutterCapture()
+    {
+        if (_decoder is INativeCalibrationController calibrationController)
+        {
+            calibrationController.BeginShutterCapture();
+        }
+    }
 
     public CameraThermometryStateSnapshot GetStateSnapshot() => _state.Snapshot();
 
@@ -316,6 +344,7 @@ internal sealed class CameraPreviewController : IDisposable
 
                 PublishBitmap(previewBitmap);
                 FrameDecoded?.Invoke(decodedFrame);
+                DrainCalibrationEvents();
 
                 if (!publishedFormat)
                 {
@@ -350,6 +379,20 @@ internal sealed class CameraPreviewController : IDisposable
             capture.Dispose();
             ClearPreview();
             StatusChanged?.Invoke("Measurement stopped.");
+        }
+    }
+
+    private void DrainCalibrationEvents()
+    {
+        if (_decoder is not INativeCalibrationController calibrationController)
+        {
+            return;
+        }
+
+        while (calibrationController.TryDequeueCalibrationEvent(out var calibrationEvent))
+        {
+            StatusChanged?.Invoke(calibrationEvent.Message);
+            CalibrationCaptured?.Invoke(calibrationEvent);
         }
     }
 

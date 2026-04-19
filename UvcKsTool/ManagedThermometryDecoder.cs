@@ -3,6 +3,9 @@ namespace UvcKsTool;
 internal sealed class ManagedThermometryDecoder : IThermometryDecoder, INativeCalibrationController
 {
     private readonly NativeCalibrationState _calibrationState = new();
+    private readonly NativeLookupCache _lookupCache = new();
+
+    internal int NativeLookupBuildCount => _lookupCache.BuildCount;
 
     public RadiometricFrame Decode(RawFramePacket packet, ThermometryParams parameters, CameraThermometryState state)
     {
@@ -20,7 +23,8 @@ internal sealed class ManagedThermometryDecoder : IThermometryDecoder, INativeCa
             thermalHeight,
             parameters,
             snapshot,
-            _calibrationState);
+            _calibrationState,
+            _lookupCache);
         var search = SearchCore.Search(decodeResult.Temperatures, decodeResult.SearchRawCounts, packet.Width, thermalHeight);
 
         state.MarkDecoded();
@@ -57,7 +61,8 @@ internal static class ThermometryCore
         int height,
         ThermometryParams parameters,
         CameraThermometryStateSnapshot state,
-        NativeCalibrationState calibrationState)
+        NativeCalibrationState calibrationState,
+        NativeLookupCache lookupCache)
     {
         if (state.AlgorithmMode == ThermometryAlgorithmMode.Legacy)
         {
@@ -81,7 +86,8 @@ internal static class ThermometryCore
                     parameters,
                     state,
                     calibration,
-                    "calibrated raw");
+                    "calibrated raw",
+                    lookupCache);
             }
 
             if (NativeThermometryCore.CanUseLookup(transportRawCounts))
@@ -93,7 +99,8 @@ internal static class ThermometryCore
                     parameters,
                     state,
                     calibration,
-                    calibrationState.GetDirectTransportReason());
+                    calibrationState.GetDirectTransportReason(),
+                    lookupCache);
             }
 
             return CreateLegacyFallbackResult(
@@ -121,11 +128,13 @@ internal static class ThermometryCore
         ThermometryParams parameters,
         CameraThermometryStateSnapshot state,
         NativeTailCalibration calibration,
-        string reason)
+        string reason,
+        NativeLookupCache lookupCache)
     {
+        var lookupTable = lookupCache.GetOrBuild(parameters, state, calibration);
         return new TemperatureDecodeResult(
             rawCounts,
-            NativeThermometryCore.Decode(rawCounts, width, height, parameters, state, calibration),
+            NativeThermometryCore.Decode(rawCounts, width, height, parameters.Fix, lookupTable),
             ThermometryDecodeInfo.CreateNativeLookup(reason));
     }
 
@@ -183,25 +192,102 @@ internal static class NativeThermometryCore
         ushort[] rawCounts,
         int width,
         int height,
-        ThermometryParams parameters,
-        CameraThermometryStateSnapshot state,
-        NativeTailCalibration calibration)
+        float fix,
+        float[] lookupTable)
     {
         if (rawCounts.Length != width * height)
         {
             throw new ArgumentException("Raw count length does not match the expected thermal dimensions.", nameof(rawCounts));
         }
-
-        var lookupTable = NativeThermometryMath.BuildLookupTable(parameters, state, calibration);
         var temperatures = new float[rawCounts.Length];
 
         for (var i = 0; i < rawCounts.Length; i++)
         {
             var lookupIndex = Math.Min((int)rawCounts[i], LookupLength - 1);
-            temperatures[i] = parameters.Fix + lookupTable[lookupIndex];
+            temperatures[i] = fix + lookupTable[lookupIndex];
         }
 
         return temperatures;
+    }
+}
+
+internal readonly record struct NativeLookupCacheKey(
+    float AmbientTemp,
+    float ReflectedTemp,
+    float Humidity,
+    float Emissivity,
+    int Distance,
+    int RangeMode,
+    int CameraLens,
+    float ShutterFix,
+    int Width,
+    float FpaTemp,
+    float ShutterTemp,
+    float CalibrateCorrect,
+    float A,
+    float B,
+    float Ka,
+    float Kb,
+    float Kc,
+    int RawBase)
+{
+    public static NativeLookupCacheKey Create(
+        ThermometryParams parameters,
+        CameraThermometryStateSnapshot state,
+        NativeTailCalibration calibration)
+    {
+        return new NativeLookupCacheKey(
+            parameters.AmbientTemp,
+            parameters.ReflectedTemp,
+            NativeThermometryMath.NormalizeHumidity(parameters.Humidity),
+            parameters.Emissivity,
+            parameters.Distance,
+            state.RangeMode,
+            state.CameraLens,
+            state.ShutterFix,
+            calibration.Width,
+            calibration.FpaTemp,
+            calibration.ShutterTemp,
+            calibration.CalibrateCorrect,
+            calibration.A,
+            calibration.B,
+            calibration.Ka,
+            calibration.Kb,
+            calibration.Kc,
+            calibration.RawBase);
+    }
+}
+
+internal sealed class NativeLookupCache
+{
+    private readonly object _sync = new();
+
+    private NativeLookupCacheKey? _cachedKey;
+    private float[]? _cachedLookup;
+
+    public int BuildCount { get; private set; }
+
+    public float[] GetOrBuild(
+        ThermometryParams parameters,
+        CameraThermometryStateSnapshot state,
+        NativeTailCalibration calibration)
+    {
+        var key = NativeLookupCacheKey.Create(parameters, state, calibration);
+
+        lock (_sync)
+        {
+            if (_cachedKey is NativeLookupCacheKey cachedKey
+                && cachedKey == key
+                && _cachedLookup is not null)
+            {
+                return _cachedLookup;
+            }
+
+            _cachedLookup = NativeThermometryMath.BuildLookupTable(parameters, state, calibration);
+            _cachedKey = key;
+            BuildCount++;
+            return _cachedLookup;
+        }
     }
 }
 
@@ -279,7 +365,7 @@ internal static class NativeThermometryMath
         return lookupTable;
     }
 
-    private static float NormalizeHumidity(float humidity)
+    internal static float NormalizeHumidity(float humidity)
     {
         var clamped = Math.Max(humidity, 0f);
         return clamped > 1.5f ? clamped / 100f : clamped;

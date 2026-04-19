@@ -3,72 +3,139 @@ using System.Runtime.InteropServices;
 
 namespace UvcKsTool;
 
-internal static class TemperaturePreviewRenderer
+internal sealed class ReusablePreviewSurface : IDisposable
 {
-    public static Bitmap Render(RadiometricFrame frame, int paletteIndex)
+    private readonly Bitmap _bitmap;
+    private readonly byte[] _buffer;
+
+    public ReusablePreviewSurface(int width, int height)
     {
-        var bitmap = new Bitmap(frame.ThermalWidth, frame.ThermalHeight, PixelFormat.Format24bppRgb);
-        var data = bitmap.LockBits(
-            new Rectangle(0, 0, bitmap.Width, bitmap.Height),
+        _bitmap = new Bitmap(width, height, PixelFormat.Format24bppRgb);
+        var data = _bitmap.LockBits(
+            new Rectangle(0, 0, width, height),
             ImageLockMode.WriteOnly,
-            bitmap.PixelFormat);
+            _bitmap.PixelFormat);
 
         try
         {
-            var buffer = new byte[data.Stride * bitmap.Height];
-            var min = frame.MinTemp;
-            var max = frame.MaxTemp;
-            var span = Math.Max(max - min, 0.001f);
-
-            for (var y = 0; y < bitmap.Height; y++)
-            {
-                var rowOffset = y * data.Stride;
-                for (var x = 0; x < bitmap.Width; x++)
-                {
-                    var index = (y * bitmap.Width) + x;
-                    var normalized = Math.Clamp((frame.Temperatures[index] - min) / span, 0f, 1f);
-                    var color = MapColor(normalized, paletteIndex);
-                    var pixelOffset = rowOffset + (x * 3);
-                    buffer[pixelOffset] = color.B;
-                    buffer[pixelOffset + 1] = color.G;
-                    buffer[pixelOffset + 2] = color.R;
-                }
-            }
-
-            Marshal.Copy(buffer, 0, data.Scan0, buffer.Length);
+            Stride = data.Stride;
         }
         finally
         {
-            bitmap.UnlockBits(data);
+            _bitmap.UnlockBits(data);
         }
 
-        using var graphics = Graphics.FromImage(bitmap);
+        _buffer = new byte[Stride * height];
+    }
+
+    public Bitmap Bitmap => _bitmap;
+
+    public int Width => _bitmap.Width;
+
+    public int Height => _bitmap.Height;
+
+    public int Stride { get; }
+
+    public byte[] Buffer => _buffer;
+
+    public void Dispose()
+    {
+        _bitmap.Dispose();
+    }
+}
+
+internal static class TemperaturePreviewRenderer
+{
+    private static readonly IReadOnlyList<Color>[] Palettes =
+    [
+        [Color.Black, Color.DimGray, Color.Gainsboro, Color.White],
+        [Color.White, Color.Gainsboro, Color.DimGray, Color.Black],
+        [Color.FromArgb(12, 24, 88), Color.RoyalBlue, Color.OrangeRed, Color.Yellow],
+        [Color.FromArgb(56, 18, 84), Color.MediumPurple, Color.OrangeRed, Color.Yellow],
+        [Color.Navy, Color.SeaGreen, Color.Orange, Color.Red],
+        [Color.DarkBlue, Color.Cyan, Color.LimeGreen, Color.Yellow, Color.Red],
+        [Color.Purple, Color.DeepSkyBlue, Color.Lime, Color.Yellow, Color.OrangeRed],
+        [Color.Black, Color.Maroon, Color.Red, Color.Orange],
+        [Color.DarkOliveGreen, Color.DarkGreen, Color.OrangeRed, Color.Red],
+        [Color.Navy, Color.Teal, Color.OrangeRed, Color.HotPink],
+        [Color.Black, Color.DarkBlue, Color.Cyan, Color.Yellow, Color.Red, Color.White],
+        [Color.Black, Color.Firebrick, Color.Red, Color.Orange, Color.Yellow]
+    ];
+
+    private static readonly IReadOnlyList<Color> DefaultPalette =
+        [Color.DarkBlue, Color.Cyan, Color.Yellow, Color.Red];
+
+    public static Bitmap Render(RadiometricFrame frame, int paletteIndex)
+    {
+        using var surface = new ReusablePreviewSurface(frame.ThermalWidth, frame.ThermalHeight);
+        RenderInto(surface, frame, paletteIndex);
+        return (Bitmap)surface.Bitmap.Clone();
+    }
+
+    public static void RenderInto(ReusablePreviewSurface surface, RadiometricFrame frame, int paletteIndex)
+    {
+        if (surface.Width != frame.ThermalWidth || surface.Height != frame.ThermalHeight)
+        {
+            throw new ArgumentException("Preview surface size does not match frame dimensions.", nameof(surface));
+        }
+
+        var palette = GetPaletteStops(paletteIndex);
+        FillPixelBuffer(surface.Buffer, surface.Stride, frame, palette);
+
+        var data = surface.Bitmap.LockBits(
+            new Rectangle(0, 0, surface.Width, surface.Height),
+            ImageLockMode.WriteOnly,
+            surface.Bitmap.PixelFormat);
+
+        try
+        {
+            Marshal.Copy(surface.Buffer, 0, data.Scan0, surface.Buffer.Length);
+        }
+        finally
+        {
+            surface.Bitmap.UnlockBits(data);
+        }
+
+        using var graphics = Graphics.FromImage(surface.Bitmap);
         DrawCrosshair(graphics, GetCenterPoint(frame), Color.Gold);
         DrawMarker(graphics, frame.MaxPoint, Color.Red);
         DrawMarker(graphics, frame.MinPoint, Color.DeepSkyBlue);
-        return bitmap;
     }
 
-    private static Color MapColor(float normalized, int paletteIndex)
+    private static IReadOnlyList<Color> GetPaletteStops(int paletteIndex)
     {
-        Color[] stops = paletteIndex switch
+        if ((uint)paletteIndex < (uint)Palettes.Length)
         {
-            0 => [Color.Black, Color.DimGray, Color.Gainsboro, Color.White],
-            1 => [Color.White, Color.Gainsboro, Color.DimGray, Color.Black],
-            2 => [Color.FromArgb(12, 24, 88), Color.RoyalBlue, Color.OrangeRed, Color.Yellow],
-            3 => [Color.FromArgb(56, 18, 84), Color.MediumPurple, Color.OrangeRed, Color.Yellow],
-            4 => [Color.Navy, Color.SeaGreen, Color.Orange, Color.Red],
-            5 => [Color.DarkBlue, Color.Cyan, Color.LimeGreen, Color.Yellow, Color.Red],
-            6 => [Color.Purple, Color.DeepSkyBlue, Color.Lime, Color.Yellow, Color.OrangeRed],
-            7 => [Color.Black, Color.Maroon, Color.Red, Color.Orange],
-            8 => [Color.DarkOliveGreen, Color.DarkGreen, Color.OrangeRed, Color.Red],
-            9 => [Color.Navy, Color.Teal, Color.OrangeRed, Color.HotPink],
-            10 => [Color.Black, Color.DarkBlue, Color.Cyan, Color.Yellow, Color.Red, Color.White],
-            11 => [Color.Black, Color.Firebrick, Color.Red, Color.Orange, Color.Yellow],
-            _ => [Color.DarkBlue, Color.Cyan, Color.Yellow, Color.Red]
-        };
+            return Palettes[paletteIndex];
+        }
 
-        return InterpolateStops(stops, normalized);
+        return DefaultPalette;
+    }
+
+    private static void FillPixelBuffer(
+        byte[] buffer,
+        int stride,
+        RadiometricFrame frame,
+        IReadOnlyList<Color> palette)
+    {
+        var min = frame.MinTemp;
+        var max = frame.MaxTemp;
+        var span = Math.Max(max - min, 0.001f);
+
+        for (var y = 0; y < frame.ThermalHeight; y++)
+        {
+            var rowOffset = y * stride;
+            for (var x = 0; x < frame.ThermalWidth; x++)
+            {
+                var index = (y * frame.ThermalWidth) + x;
+                var normalized = Math.Clamp((frame.Temperatures[index] - min) / span, 0f, 1f);
+                var color = InterpolateStops(palette, normalized);
+                var pixelOffset = rowOffset + (x * 3);
+                buffer[pixelOffset] = color.B;
+                buffer[pixelOffset + 1] = color.G;
+                buffer[pixelOffset + 2] = color.R;
+            }
+        }
     }
 
     private static Color Blend(Color start, Color end, float t)

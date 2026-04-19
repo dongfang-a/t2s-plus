@@ -320,6 +320,100 @@ public sealed class RadiometricPipelineTests
         Assert.True(BitmapsEqual(baselinePreview, adjustedPreview));
     }
 
+    [Fact]
+    public void PreviewFrameScheduler_LimitsProcessingToConfiguredCadence()
+    {
+        var scheduler = new PreviewFrameScheduler(TimeSpan.FromMilliseconds(40));
+
+        Assert.True(scheduler.ShouldProcess(TimeSpan.Zero));
+        Assert.False(scheduler.ShouldProcess(TimeSpan.FromMilliseconds(10)));
+        Assert.False(scheduler.ShouldProcess(TimeSpan.FromMilliseconds(39)));
+        Assert.True(scheduler.ShouldProcess(TimeSpan.FromMilliseconds(40)));
+        Assert.False(scheduler.ShouldProcess(TimeSpan.FromMilliseconds(70)));
+        Assert.True(scheduler.ShouldProcess(TimeSpan.FromMilliseconds(80)));
+    }
+
+    [Fact]
+    public void LatestOnlyUiQueue_OnlyKeepsMostRecentPendingUpdate()
+    {
+        var queue = new LatestOnlyUiQueue<int>();
+
+        Assert.True(queue.Enqueue(1));
+        Assert.False(queue.Enqueue(2));
+        Assert.True(queue.HasInvokeQueued);
+        Assert.True(queue.HasPendingUpdate);
+
+        Assert.True(queue.TryTakeLatest(out var first));
+        Assert.Equal(2, first);
+        Assert.True(queue.HasInvokeQueued);
+        Assert.False(queue.HasPendingUpdate);
+
+        Assert.False(queue.Enqueue(3));
+        Assert.True(queue.HasPendingUpdate);
+
+        Assert.True(queue.TryTakeLatest(out var second));
+        Assert.Equal(3, second);
+        Assert.False(queue.HasPendingUpdate);
+
+        Assert.False(queue.TryTakeLatest(out _));
+        Assert.False(queue.HasInvokeQueued);
+    }
+
+    [Fact]
+    public void NativeLookupCache_ReusesLookupForIdenticalInputs()
+    {
+        var decoder = new ManagedThermometryDecoder();
+        var state = new CameraThermometryState();
+        var frame = CreateModerateRawFrame();
+
+        _ = decoder.Decode(frame, ThermometryParams.Default, state);
+        _ = decoder.Decode(frame, ThermometryParams.Default, state);
+
+        Assert.Equal(1, decoder.NativeLookupBuildCount);
+    }
+
+    [Fact]
+    public void NativeLookupCache_DoesNotRebuildWhenOnlyFixChanges()
+    {
+        var decoder = new ManagedThermometryDecoder();
+        var state = new CameraThermometryState();
+        var frame = CreateModerateRawFrame();
+
+        var baseline = decoder.Decode(frame, ThermometryParams.Default, state);
+        var adjusted = decoder.Decode(frame, ThermometryParams.Default with { Fix = 10f }, state);
+
+        Assert.Equal(1, decoder.NativeLookupBuildCount);
+        Assert.Equal(baseline.CenterTemp + 10f, adjusted.CenterTemp, 3);
+    }
+
+    [Fact]
+    public void NativeLookupCache_RebuildsWhenAmbientChanges()
+    {
+        var decoder = new ManagedThermometryDecoder();
+        var state = new CameraThermometryState();
+        var frame = CreateModerateRawFrame();
+
+        _ = decoder.Decode(frame, ThermometryParams.Default, state);
+        _ = decoder.Decode(frame, ThermometryParams.Default with { AmbientTemp = 35f }, state);
+
+        Assert.Equal(2, decoder.NativeLookupBuildCount);
+    }
+
+    [Fact]
+    public void NativeLookupCache_RebuildsWhenCalibrationChanges()
+    {
+        var decoder = new ManagedThermometryDecoder();
+        var state = new CameraThermometryState();
+        var baselineFrame = CreateModerateRawFrame();
+        var adjustedFrame = CreateModerateRawFrame();
+        WriteNativeCalibration256(adjustedFrame.RawBytes, adjustedFrame.Width, adjustedFrame.Height, rawBase: 2300);
+
+        _ = decoder.Decode(baselineFrame, ThermometryParams.Default, state);
+        _ = decoder.Decode(adjustedFrame, ThermometryParams.Default, state);
+
+        Assert.Equal(2, decoder.NativeLookupBuildCount);
+    }
+
     private static RawFramePacket CreateRawFrame()
     {
         const int width = 256;

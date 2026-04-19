@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using OpenCvSharp;
 
@@ -8,6 +9,7 @@ internal sealed class CameraPreviewController : IDisposable
     private const int ExpectedWidth = 256;
     private const int ExpectedHeight = 196;
     private const int ExpectedBytes = ExpectedWidth * ExpectedHeight * sizeof(ushort);
+    private static readonly TimeSpan PreviewInterval = TimeSpan.FromMilliseconds(40);
     private static readonly CaptureCandidate[] CaptureCandidates =
     [
         new(VideoCaptureAPIs.MSMF, "Media Foundation", null),
@@ -22,6 +24,12 @@ internal sealed class CameraPreviewController : IDisposable
     private readonly IThermometryDecoder _decoder;
     private readonly object _sync = new();
     private readonly CameraThermometryState _state = new();
+    private readonly LatestOnlyUiQueue<PendingPreviewUpdate> _previewPublishQueue = new();
+    private readonly byte[][] _packetBuffers =
+    [
+        new byte[ExpectedBytes],
+        new byte[ExpectedBytes]
+    ];
 
     private CancellationTokenSource? _cts;
     private Task? _loopTask;
@@ -29,7 +37,13 @@ internal sealed class CameraPreviewController : IDisposable
     private bool _parametersSeeded;
     private RawFramePacket? _latestPacket;
     private RadiometricFrame? _latestFrame;
+    private int _latestPacketBufferIndex = -1;
     private int _paletteIndex;
+    private ReusablePreviewSurface[]? _previewSurfaces;
+    private int _nextPreviewSurfaceIndex;
+    private ReusablePreviewSurface? _displaySurface;
+    private ReusablePreviewSurface? _applyingSurface;
+    private ReusablePreviewSurface? _pendingSurface;
 
     public CameraPreviewController(PictureBox pictureBox, IThermometryDecoder? decoder = null)
     {
@@ -120,6 +134,11 @@ internal sealed class CameraPreviewController : IDisposable
     public void Dispose()
     {
         Stop();
+
+        lock (_sync)
+        {
+            DisposePreviewSurfacesUnsafe();
+        }
     }
 
     public void UpdateThermometryParams(ThermometryParams parameters)
@@ -184,13 +203,18 @@ internal sealed class CameraPreviewController : IDisposable
 
         lock (_sync)
         {
-            packet = _latestPacket;
-            frame = _latestFrame;
-        }
+            if (_latestPacket is null || _latestFrame is null)
+            {
+                throw new InvalidOperationException("No decoded radiometric frame is available yet.");
+            }
 
-        if (packet is null || frame is null)
-        {
-            throw new InvalidOperationException("No decoded radiometric frame is available yet.");
+            packet = new RawFramePacket(
+                _latestPacket.Width,
+                _latestPacket.Height,
+                _latestPacket.Timestamp,
+                (byte[])_latestPacket.RawBytes.Clone(),
+                _latestPacket.TransportFormat);
+            frame = _latestFrame;
         }
 
         var outputDirectory = Path.Combine(rootDirectory, $"capture-{DateTime.Now:yyyyMMdd-HHmmss}");
@@ -258,6 +282,8 @@ internal sealed class CameraPreviewController : IDisposable
 
     private static bool TryReadRawProbeFrame(VideoCapture capture, Mat probeFrame, out string description)
     {
+        var probeBuffer = new byte[ExpectedBytes];
+
         for (var attempt = 0; attempt < 20; attempt++)
         {
             if (!capture.Read(probeFrame) || probeFrame.Empty())
@@ -266,7 +292,7 @@ internal sealed class CameraPreviewController : IDisposable
                 continue;
             }
 
-            if (TryBuildRawFramePacket(probeFrame, out _, out var probeDescription))
+            if (TryBuildRawFramePacket(probeFrame, probeBuffer, out _, out var probeDescription))
             {
                 description = probeDescription;
                 return true;
@@ -314,6 +340,8 @@ internal sealed class CameraPreviewController : IDisposable
     private void CaptureLoop(VideoCapture capture, CancellationToken token)
     {
         using var rawFrame = new Mat();
+        var scheduler = new PreviewFrameScheduler(PreviewInterval);
+        var stopwatch = Stopwatch.StartNew();
         var publishedFormat = false;
         var publishedEmbeddedParameters = false;
 
@@ -327,23 +355,35 @@ internal sealed class CameraPreviewController : IDisposable
                     continue;
                 }
 
-                if (!TryBuildRawFramePacket(rawFrame, out var packet, out var frameDescription))
+                if (!scheduler.ShouldProcess(stopwatch.Elapsed))
+                {
+                    continue;
+                }
+
+                var packetBufferIndex = RentPacketBufferIndex();
+                if (!TryBuildRawFramePacket(rawFrame, _packetBuffers[packetBufferIndex], out var packet, out var frameDescription))
                 {
                     throw new InvalidOperationException(frameDescription);
                 }
 
+                var previewSurface = AcquirePreviewSurface(packet.Width, packet.Height - FrameTailParser.MetadataRows);
+                if (previewSurface is null)
+                {
+                    continue;
+                }
+
                 var activeParameters = ResolveActiveParameters(packet);
                 var decodedFrame = _decoder.Decode(packet, activeParameters, _state);
-                var previewBitmap = TemperaturePreviewRenderer.Render(decodedFrame, GetPaletteIndex());
+                TemperaturePreviewRenderer.RenderInto(previewSurface, decodedFrame, GetPaletteIndex());
 
                 lock (_sync)
                 {
                     _latestPacket = packet;
                     _latestFrame = decodedFrame;
+                    _latestPacketBufferIndex = packetBufferIndex;
                 }
 
-                PublishBitmap(previewBitmap);
-                FrameDecoded?.Invoke(decodedFrame);
+                QueuePreviewUpdate(previewSurface, decodedFrame);
                 DrainCalibrationEvents();
 
                 if (!publishedFormat)
@@ -379,6 +419,75 @@ internal sealed class CameraPreviewController : IDisposable
             capture.Dispose();
             ClearPreview();
             StatusChanged?.Invoke("Measurement stopped.");
+        }
+    }
+
+    private void QueuePreviewUpdate(ReusablePreviewSurface surface, RadiometricFrame frame)
+    {
+        lock (_sync)
+        {
+            _pendingSurface = surface;
+        }
+
+        var shouldSchedule = _previewPublishQueue.Enqueue(new PendingPreviewUpdate(surface, frame));
+        if (!shouldSchedule)
+        {
+            return;
+        }
+
+        if (_pictureBox.IsDisposed)
+        {
+            _previewPublishQueue.Clear();
+            return;
+        }
+
+        void Flush() => FlushPendingPreviewUpdates();
+
+        if (_pictureBox.InvokeRequired)
+        {
+            try
+            {
+                _pictureBox.BeginInvoke((MethodInvoker)Flush);
+            }
+            catch
+            {
+                _previewPublishQueue.Clear();
+            }
+        }
+        else
+        {
+            Flush();
+        }
+    }
+
+    private void FlushPendingPreviewUpdates()
+    {
+        if (_pictureBox.IsDisposed)
+        {
+            _previewPublishQueue.Clear();
+            return;
+        }
+
+        while (_previewPublishQueue.TryTakeLatest(out var update))
+        {
+            lock (_sync)
+            {
+                if (ReferenceEquals(_pendingSurface, update.Surface))
+                {
+                    _pendingSurface = null;
+                }
+
+                _applyingSurface = update.Surface;
+            }
+
+            _pictureBox.Image = update.Surface.Bitmap;
+            FrameDecoded?.Invoke(update.Frame);
+
+            lock (_sync)
+            {
+                _displaySurface = update.Surface;
+                _applyingSurface = null;
+            }
         }
     }
 
@@ -428,7 +537,84 @@ internal sealed class CameraPreviewController : IDisposable
         }
     }
 
-    private static bool TryBuildRawFramePacket(Mat source, out RawFramePacket packet, out string description)
+    private int RentPacketBufferIndex()
+    {
+        lock (_sync)
+        {
+            return _latestPacketBufferIndex == 0 ? 1 : 0;
+        }
+    }
+
+    private ReusablePreviewSurface? AcquirePreviewSurface(int width, int height)
+    {
+        lock (_sync)
+        {
+            EnsurePreviewSurfacesUnsafe(width, height);
+            if (_previewSurfaces is null)
+            {
+                return null;
+            }
+
+            for (var i = 0; i < _previewSurfaces.Length; i++)
+            {
+                var index = (_nextPreviewSurfaceIndex + i) % _previewSurfaces.Length;
+                var candidate = _previewSurfaces[index];
+                if (ReferenceEquals(candidate, _displaySurface)
+                    || ReferenceEquals(candidate, _applyingSurface)
+                    || ReferenceEquals(candidate, _pendingSurface))
+                {
+                    continue;
+                }
+
+                _nextPreviewSurfaceIndex = (index + 1) % _previewSurfaces.Length;
+                return candidate;
+            }
+
+            return null;
+        }
+    }
+
+    private void EnsurePreviewSurfacesUnsafe(int width, int height)
+    {
+        if (_previewSurfaces is not null
+            && _previewSurfaces.Length > 0
+            && _previewSurfaces[0].Width == width
+            && _previewSurfaces[0].Height == height)
+        {
+            return;
+        }
+
+        DisposePreviewSurfacesUnsafe();
+
+        _previewSurfaces =
+        [
+            new ReusablePreviewSurface(width, height),
+            new ReusablePreviewSurface(width, height),
+            new ReusablePreviewSurface(width, height),
+            new ReusablePreviewSurface(width, height)
+        ];
+        _nextPreviewSurfaceIndex = 0;
+        _displaySurface = null;
+        _applyingSurface = null;
+        _pendingSurface = null;
+    }
+
+    private void DisposePreviewSurfacesUnsafe()
+    {
+        if (_previewSurfaces is null)
+        {
+            return;
+        }
+
+        foreach (var surface in _previewSurfaces)
+        {
+            surface.Dispose();
+        }
+
+        _previewSurfaces = null;
+    }
+
+    private static bool TryBuildRawFramePacket(Mat source, byte[] rawBytes, out RawFramePacket packet, out string description)
     {
         packet = null!;
 
@@ -439,22 +625,20 @@ internal sealed class CameraPreviewController : IDisposable
         }
 
         var totalBytes = checked((int)(source.Total() * source.ElemSize()));
-        var rowBytes = checked((int)(source.Width * source.ElemSize()));
-        var rawBytes = new byte[totalBytes];
+        if (totalBytes != ExpectedBytes)
+        {
+            description =
+                $"expected {ExpectedWidth}x{ExpectedHeight}x16-bit transport ({ExpectedBytes} bytes), " +
+                $"got {source.Width}x{source.Height}, type={source.Type()}, bytes={totalBytes}";
+            return false;
+        }
 
+        var rowBytes = checked((int)(source.Width * source.ElemSize()));
         var rows = source.Height;
         for (var y = 0; y < rows; y++)
         {
             var srcRow = new IntPtr(source.Data + (y * (long)source.Step()));
             Marshal.Copy(srcRow, rawBytes, y * rowBytes, rowBytes);
-        }
-
-        if (rawBytes.Length != ExpectedBytes)
-        {
-            description =
-                $"expected {ExpectedWidth}x{ExpectedHeight}x16-bit transport ({ExpectedBytes} bytes), " +
-                $"got {source.Width}x{source.Height}, type={source.Type()}, bytes={rawBytes.Length}";
-            return false;
         }
 
         packet = new RawFramePacket(
@@ -464,44 +648,21 @@ internal sealed class CameraPreviewController : IDisposable
             rawBytes,
             RawTransportFormat.UInt16LittleEndian);
 
-        description = $"source {source.Width}x{source.Height}, type={source.Type()}, bytes={rawBytes.Length}";
+        description = $"source {source.Width}x{source.Height}, type={source.Type()}, bytes={totalBytes}";
         return true;
-    }
-
-    private void PublishBitmap(Bitmap bitmap)
-    {
-        if (_pictureBox.IsDisposed)
-        {
-            bitmap.Dispose();
-            return;
-        }
-
-        void Apply()
-        {
-            var previous = _pictureBox.Image;
-            _pictureBox.Image = bitmap;
-            previous?.Dispose();
-        }
-
-        if (_pictureBox.InvokeRequired)
-        {
-            try
-            {
-                _pictureBox.BeginInvoke((MethodInvoker)Apply);
-            }
-            catch
-            {
-                bitmap.Dispose();
-            }
-        }
-        else
-        {
-            Apply();
-        }
     }
 
     private void ClearPreview()
     {
+        _previewPublishQueue.Clear();
+
+        lock (_sync)
+        {
+            _displaySurface = null;
+            _applyingSurface = null;
+            _pendingSurface = null;
+        }
+
         if (_pictureBox.IsDisposed)
         {
             return;
@@ -509,9 +670,7 @@ internal sealed class CameraPreviewController : IDisposable
 
         void Clear()
         {
-            var previous = _pictureBox.Image;
             _pictureBox.Image = null;
-            previous?.Dispose();
         }
 
         if (_pictureBox.InvokeRequired)
@@ -533,4 +692,119 @@ internal sealed class CameraPreviewController : IDisposable
     private sealed record CaptureCandidate(VideoCaptureAPIs Api, string Description, int? FourCc);
 
     private sealed record CaptureSession(VideoCapture Capture, string Description);
+
+    private sealed record PendingPreviewUpdate(
+        ReusablePreviewSurface Surface,
+        RadiometricFrame Frame);
+}
+
+internal sealed class PreviewFrameScheduler
+{
+    private readonly TimeSpan _interval;
+    private TimeSpan _nextDue;
+    private bool _started;
+
+    public PreviewFrameScheduler(TimeSpan interval)
+    {
+        if (interval <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(interval));
+        }
+
+        _interval = interval;
+    }
+
+    public bool ShouldProcess(TimeSpan elapsed)
+    {
+        if (!_started)
+        {
+            _started = true;
+            _nextDue = elapsed + _interval;
+            return true;
+        }
+
+        if (elapsed < _nextDue)
+        {
+            return false;
+        }
+
+        _nextDue = elapsed + _interval;
+        return true;
+    }
+}
+
+internal sealed class LatestOnlyUiQueue<T>
+{
+    private readonly object _sync = new();
+
+    private bool _invokeQueued;
+    private bool _hasPending;
+    private T? _pending;
+
+    public bool HasInvokeQueued
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _invokeQueued;
+            }
+        }
+    }
+
+    public bool HasPendingUpdate
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _hasPending;
+            }
+        }
+    }
+
+    public bool Enqueue(T value)
+    {
+        lock (_sync)
+        {
+            _pending = value;
+            _hasPending = true;
+
+            if (_invokeQueued)
+            {
+                return false;
+            }
+
+            _invokeQueued = true;
+            return true;
+        }
+    }
+
+    public bool TryTakeLatest(out T value)
+    {
+        lock (_sync)
+        {
+            if (_hasPending)
+            {
+                value = _pending!;
+                _pending = default;
+                _hasPending = false;
+                return true;
+            }
+
+            _invokeQueued = false;
+            value = default!;
+            return false;
+        }
+    }
+
+    public void Clear()
+    {
+        lock (_sync)
+        {
+            _pending = default;
+            _hasPending = false;
+            _invokeQueued = false;
+        }
+    }
 }
